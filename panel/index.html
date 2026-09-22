@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DeepSeek 网关控制台 (企业级增强版)</title>
+<style>
+  :root {
+    --bg: #090d13;
+    --panel: #121820;
+    --panel2: #182230;
+    --line: #222f42;
+    --fg: #e2e8f0;
+    --dim: #7f8ea3;
+    --accent: #3b82f6;
+    --accent-hover: #2563eb;
+    --ok: #10b981;
+    --ok-bg: #064e3b;
+    --warn: #f59e0b;
+    --warn-bg: #78350f;
+    --err: #ef4444;
+    --err-bg: #7f1d1d;
+    --purple: #8b5cf6;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 24px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+    position: sticky;
+    top: 0;
+    z-index: 50;
+  }
+  header h1 {
+    font-size: 15px;
+    margin: 0;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--ok);
+    box-shadow: 0 0 10px var(--ok);
+  }
+  .dot.off {
+    background: var(--err);
+    box-shadow: 0 0 10px var(--err);
+  }
+  .spacer { flex: 1; }
+  .meta-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--panel2);
+    border: 1px solid var(--line);
+    padding: 3px 9px;
+    border-radius: 20px;
+    font-size: 11.5px;
+    color: var(--dim);
+  }
+  .meta-badge.wasm {
+    color: #38bdf8;
+    border-color: #0369a1;
+    background: #082f49;
+  }
+  nav {
+    display: flex;
+    gap: 6px;
+    padding: 0 24px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  nav button {
+    background: none;
+    border: none;
+    color: var(--dim);
+    padding: 12px 16px;
+    cursor: pointer;
+    font-size: 13px;
+    border-bottom: 2px solid transparent;
+    transition: 0.15s;
+  }
+  nav button:hover { color: var(--fg); }
+  nav button.on {
+    color: #fff;
+    font-weight: 500;
+    border-bottom-color: var(--accent);
+  }
+  button.btn {
+    background: var(--panel2);
+    color: var(--fg);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 6px 12px;
+    cursor: pointer;
+    font-size: 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    transition: 0.15s;
+  }
+  button.btn:hover { border-color: var(--accent); }
+  button.btn.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  button.btn.primary:hover { background: var(--accent-hover); }
+  button.btn.success {
+    background: #059669;
+    border-color: #059669;
+    color: #fff;
+  }
+  button.btn.warning {
+    background: #d97706;
+    border-color: #d97706;
+    color: #fff;
+  }
+  button.btn.danger {
+    color: #fca5a5;
+    background: #450a0a;
+    border-color: #991b1b;
+  }
+  button.btn.danger:hover { background: #7f1d1d; }
+  main {
+    padding: 20px 24px;
+    max-width: 1600px;
+    margin: 0 auto;
+  }
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 14px;
+    margin-bottom: 20px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .card .k {
+    color: var(--dim);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .card .v {
+    font-size: 22px;
+    font-weight: 600;
+    margin-top: 6px;
+    font-variant-numeric: tabular-nums;
+  }
+  .card .s {
+    color: var(--dim);
+    font-size: 11px;
+    margin-top: 4px;
+  }
+  h2 {
+    font-size: 13px;
+    color: var(--dim);
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    margin: 22px 0 10px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  th {
+    text-align: left;
+    padding: 9px 14px;
+    background: var(--panel2);
+    color: var(--dim);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  td {
+    padding: 9px 14px;
+    border-top: 1px solid var(--line);
+    font-size: 12px;
+  }
+  tr:hover td { background: #182333; }
+  code {
+    font-family: "SF Mono", Consolas, Menlo, monospace;
+    font-size: 11.5px;
+    color: #93c5fd;
+    background: #0f172a;
+    padding: 2px 5px;
+    border-radius: 4px;
+  }
+  .tag {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 11px;
+    border: 1px solid;
+    line-height: 1.5;
+    white-space: nowrap;
+  }
+  .t-ok { color: #34d399; border-color: #059669; background: #064e3b; }
+  .t-err { color: #f87171; border-color: #dc2626; background: #450a0a; }
+  .t-warn { color: #fbbf24; border-color: #d97706; background: #451a03; }
+  .t-dim { color: var(--dim); border-color: var(--line); background: var(--panel2); }
+  .t-info { color: #60a5fa; border-color: #2563eb; background: #1e3a8a; }
+  .empty {
+    color: var(--dim);
+    padding: 24px;
+    text-align: center;
+    background: var(--panel);
+    border: 1px dashed var(--line);
+    border-radius: 10px;
+  }
+  .flex {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .err-box {
+    background: #450a0a;
+    border: 1px solid #991b1b;
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 8px;
+    font-size: 12px;
+  }
+  .err-box b { color: #f87171; }
+  .muted { color: var(--dim); }
+  /* 登录遮罩 */
+  #login {
+    position: fixed;
+    inset: 0;
+    background: var(--bg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+  }
+  #login .box {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 30px;
+    width: 360px;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+  }
+  #login h2 {
+    margin: 0 0 6px;
+    font-size: 18px;
+    color: var(--fg);
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  #login input {
+    width: 100%;
+    margin-bottom: 12px;
+    padding: 10px;
+    background: #070b11;
+    border: 1px solid var(--line);
+    color: #fff;
+    border-radius: 6px;
+  }
+  #login button {
+    width: 100%;
+    padding: 10px;
+    font-size: 13px;
+  }
+  #login .err {
+    color: var(--err);
+    font-size: 12px;
+    min-height: 18px;
+    margin-top: 8px;
+  }
+  .modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.75);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 60;
+  }
+  .modal .box {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 22px 24px;
+    width: 480px;
+    max-height: 88vh;
+    overflow: auto;
+  }
+  .modal h3 { margin: 0 0 16px; font-size: 15px; }
+  .modal label {
+    display: block;
+    color: var(--dim);
+    font-size: 11.5px;
+    margin: 12px 0 5px;
+  }
+  .modal input, .modal select {
+    width: 100%;
+    background: #090d14;
+    border: 1px solid var(--line);
+    color: #fff;
+    padding: 8px 10px;
+    border-radius: 6px;
+  }
+</style>
+</head>
+<body>
+
+<!-- 登录模态框 -->
+<div id="login">
+  <div class="box">
+    <h2>DeepSeek 网关后台</h2>
+    <div class="muted" style="margin-bottom: 18px">请登录以管理账号与 API Key</div>
+    <input id="lg-user" placeholder="用户名" autocomplete="username">
+    <input id="lg-pass" type="password" placeholder="密码" autocomplete="current-password">
+    <button class="btn primary" id="lg-btn">登录</button>
+    <div class="err" id="lg-err"></div>
+    <div class="muted" style="margin-top:12px;font-size:11px">默认账户: admin / admin，初次登录后可修改</div>
+  </div>
+</div>
+
+<!-- 顶栏 -->
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>DeepSeek Gateway</h1>
+  <span class="meta-badge wasm" id="wasm-badge">⚡ WASM 加速就绪 (85ms)</span>
+  <span class="meta-badge" id="pool-badge">账号: 0/0 正常</span>
+  <span class="spacer"></span>
+  <span class="meta-badge" id="up">运行 0m</span>
+  <button class="btn" id="btn-refresh">🔄 刷新</button>
+  <button class="btn" id="btn-pw">🔑 改密码</button>
+  <button class="btn danger" id="btn-logout">退出</button>
+</header>
+
+<!-- 导航 -->
+<nav>
+  <button class="on" data-tab="dash">📊 仪表大盘</button>
+  <button data-tab="accounts">👥 账号调度管理</button>
+  <button data-tab="logs">📜 持久请求日志</button>
+  <button data-tab="usage">💎 Token 统计</button>
+  <button data-tab="keys">🔑 API Key 管理</button>
+</nav>
+
+<main>
+  <!-- 仪表大盘 -->
+  <section id="tab-dash">
+    <div class="cards" id="cards"></div>
+    <h2>
+      <span>最近请求 (持久化存储)</span>
+      <button class="btn" onclick="switchTab('logs')">查看完整日志 →</button>
+    </h2>
+    <div id="recent"></div>
+    <h2>系统异常事件</h2>
+    <div id="errors"></div>
+  </section>
+
+  <!-- 账号调度管理 -->
+  <section id="tab-accounts" style="display:none">
+    <div class="flex" style="margin-bottom:14px;justify-content:space-between">
+      <div class="flex">
+        <button class="btn primary" id="btn-newacc">+ 添加 DeepSeek 账号</button>
+        <button class="btn" id="btn-testall">⚡ 批量测试全部 Token</button>
+      </div>
+      <div class="muted">
+        💡 遇到 <code>40003 invalid token</code> 会自动暂停调度隔离该账号，不影响其他账号正常响应！
+      </div>
+    </div>
+    <div id="accounts"></div>
+  </section>
+
+  <!-- 持久请求日志 -->
+  <section id="tab-logs" style="display:none">
+    <div class="flex" style="margin-bottom:14px">
+      <label class="muted">状态筛选: </label>
+      <button class="btn primary log-filter" data-status="all">全部</button>
+      <button class="btn log-filter" data-status="ok">仅成功</button>
+      <button class="btn log-filter" data-status="err">仅失败</button>
+      <span class="spacer"></span>
+      <span class="muted" id="log-count">共 0 条持久记录</span>
+    </div>
+    <div id="full-logs"></div>
+  </section>
+
+  <!-- Token 统计 -->
+  <section id="tab-usage" style="display:none">
+    <div class="cards" id="usage-cards"></div>
+    <h2>每日 Token 用量明细</h2>
+    <div id="usage-day"></div>
+    <h2>按 DeepSeek 账号统计</h2>
+    <div id="usage-acc"></div>
+  </section>
+
+  <!-- API Key 管理 -->
+  <section id="tab-keys" style="display:none">
+    <div class="flex" style="margin-bottom:14px">
+      <button class="btn primary" id="btn-newkey">+ 新建 API Key</button>
+      <span class="muted">Key 不绑定特定 DeepSeek 账号，支持全局调度池；支持按 Key 计量用量</span>
+    </div>
+    <div id="keys"></div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtNum = n => Number(n||0).toLocaleString('en-US');
+const fmtMs = ms => ms > 1000 ? (ms/1000).toFixed(2)+'s' : ms+'ms';
+const fmtTime = t => {
+  if (!t) return '-';
+  const d = new Date(t);
+  return d.toTimeString().slice(0,8);
+};
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, {
+    ...opts,
+    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) }
+  });
+  if (r.status === 401) {
+    $('login').style.display = 'flex';
+    throw new Error('未授权，请先登录');
+  }
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error ? (data.error.message || data.error) : ('HTTP ' + r.status));
+  return data;
+}
+
+// 标签页切换
+function switchTab(t) {
+  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.tab === t));
+  document.querySelectorAll('main > section').forEach(s => s.style.display = s.id === 'tab-' + t ? 'block' : 'none');
+  if (t === 'dash') loadDash();
+  if (t === 'accounts') loadAccounts();
+  if (t === 'logs') loadLogs();
+  if (t === 'usage') loadUsage();
+  if (t === 'keys') loadKeys();
+}
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => switchTab(b.dataset.tab));
+
+// 登录处理
+$('lg-btn').onclick = async () => {
+  $('lg-err').textContent = '';
+  try {
+    const r = await api('/api/login', {
+      method: 'POST',
+      body: JSON.stringify({ username: $('lg-user').value, password: $('lg-pass').value })
+    });
+    $('login').style.display = 'none';
+    loadDash();
+  } catch(e) {
+    $('lg-err').textContent = e.message;
+  }
+};
+$('btn-logout').onclick = async () => {
+  await api('/api/logout', { method: 'POST' });
+  location.reload();
+};
+
+function card(k, v, s) {
+  return `<div class="card"><div class="k">${esc(k)}</div><div class="v">${v}</div>${s ? `<div class="s">${s}</div>` : ''}</div>`;
+}
+
+// ---------- 仪表大盘 ----------
+async function loadDash() {
+  try {
+    const d = await api('/v1/stats');
+    $('dot').className = 'dot';
+    $('up').textContent = '运行 ' + d.uptimeHuman;
+
+    const wasmReady = d.pool && d.pool.wasmAcceleration;
+    $('wasm-badge').innerHTML = wasmReady ? '⚡ WASM 硬件加速 (85ms)' : '⚠️ 纯 JS 运算';
+    $('wasm-badge').className = wasmReady ? 'meta-badge wasm' : 'meta-badge';
+
+    const p = d.pool || {};
+    $('pool-badge').textContent = `账号池: ${p.healthy || 0}/${p.accounts || 0} 正常调度`;
+
+    const r = d.requests || {};
+    const tk = d.tokens || {};
+
+    $('cards').innerHTML = [
+      card('总请求量 (永久记录)', fmtNum(r.total), `${r.perSec || 0} req/s`),
+      card('成功率', r.total ? ((r.ok / r.total) * 100).toFixed(1) + '%' : '100%', `${r.ok} 成功 / ${r.err} 失败`),
+      card('总消耗 Token', fmtNum(tk.total), `入 ${fmtNum(tk.prompt)} · 出 ${fmtNum(tk.completion)}`),
+      card('思考链 Token', fmtNum(tk.thinking), 'Thinking 深度思考'),
+      card('平均耗时 (端到端)', fmtMs(r.avgLatencyMs), '含 PoW 与网络响应'),
+      card('调度池状态', `${p.healthy || 0} 正常 / ${p.paused || 0} 暂停`, `${p.cooldown || 0} 个在冷却`),
+    ].join('');
+
+    const recent = d.recent || [];
+    $('recent').innerHTML = recent.length ? '<table><thead><tr>' +
+      ['时间','端点','账号','状态','耗时','特性','Token 用量','Key'].map(h => '<th>'+h+'</th>').join('') +
+      '</tr></thead><tbody>' + recent.slice(0, 15).map(q => `<tr>
+        <td class="muted">${fmtTime(q.at)}</td>
+        <td><code>${esc(q.endpoint)}</code></td>
+        <td><b>${esc(q.account)}</b></td>
+        <td><span class="tag ${q.ok ? 't-ok' : 't-err'}">${q.status}</span></td>
+        <td>${fmtMs(q.ms)}</td>
+        <td>${[q.stream?'流式':'',q.tools?'工具':'',q.thinking?'思考':'',q.search?'联网':''].filter(Boolean).map(x=>'<span class="tag t-info">'+x+'</span>').join(' ')}</td>
+        <td>${q.tokens ? `${q.tokens.total} (${q.tokens.prompt}+${q.tokens.completion})` : '-'}</td>
+        <td class="muted">${esc(q.keyName || '-')}</td>
+      </tr>`).join('') + '</tbody></table>' : '<div class="empty">暂无 API 请求记录</div>';
+
+    $('errors').innerHTML = (d.errors && d.errors.length) ? d.errors.map(e => `
+      <div class="err-box">
+        <b>${fmtTime(e.at)}</b> <code>${esc(e.endpoint)}</code> [账号: ${esc(e.account || 'unknown')}]<br>
+        ${esc(e.error)}
+      </div>
+    `).join('') : '<div class="empty">系统健康，没有异常记录 🎉</div>';
+
+  } catch(e) {
+    $('dot').className = 'dot off';
+  }
+}
+
+// ---------- 账号管理 ----------
+async function loadAccounts() {
+  const d = await api('/api/accounts?reveal=0');
+  const accounts = d.accounts || [];
+
+  $('accounts').innerHTML = accounts.length ? '<table><thead><tr>' +
+    ['账号名称','Token 凭据','调度状态','成功/失败','当前并发','故障原因 / 最近活动','快捷操作'].map(h => '<th>'+h+'</th>').join('') +
+    '</tr></thead><tbody>' + accounts.map(a => {
+      let stateTag = '<span class="tag t-ok">🟢 正常调度</span>';
+      if (a.disabled) stateTag = '<span class="tag t-dim">⚪ 已禁用</span>';
+      else if (a.paused || a.state === 'auth_failed') stateTag = '<span class="tag t-err">🔴 异常已暂停</span>';
+      else if (a.cooldownSec > 0) stateTag = `<span class="tag t-warn">🟡 冷却中 (${a.cooldownSec}s)</span>`;
+
+      return `<tr>
+        <td>
+          <b>${esc(a.name)}</b>
+          <div class="muted" style="font-size:11px">${esc(a.email || a.mobile || '未绑定凭据')}</div>
+        </td>
+        <td>
+          <code title="点击复制" style="cursor:pointer" onclick="navigator.clipboard.writeText('${a.token}');alert('已复制 Token');">${esc(a.token || '无 Token')}</code>
+        </td>
+        <td>${stateTag}</td>
+        <td>${a.ok} 成功 / ${a.err} 失败</td>
+        <td><b>${a.inflight}</b> / 5</td>
+        <td>
+          ${a.lastError ? `<div style="color:var(--err);font-size:11.5px;max-width:300px;word-break:break-all">${esc(a.lastError)}</div>` : '<span class="muted">无异常</span>'}
+        </td>
+        <td>
+          <div class="flex">
+            <button class="btn" onclick="testAccount(${a.index})">⚡ 测试</button>
+            ${a.paused ? `<button class="btn success" onclick="resumeAccount(${a.index})">▶️ 恢复</button>` : `<button class="btn warning" onclick="pauseAccount(${a.index})">⏸️ 暂停</button>`}
+            ${a.hasPassword ? `<button class="btn" onclick="loginAccount(${a.index})">🔑 重登</button>` : ''}
+            <button class="btn" onclick="editAccount(${a.index})">✏️ 编辑</button>
+            <button class="btn danger" onclick="delAccount(${a.index})">🗑️</button>
+          </div>
+        </td>
+      </tr>`;
+    }).join('') + '</tbody></table>' : '<div class="empty">还没有账号，点上方添加</div>';
+}
+
+async function testAccount(index) {
+  try {
+    const r = await api(`/api/accounts/${index}/test`, { method: 'POST' });
+    alert('✅ 测试通过: ' + r.message);
+    loadAccounts();
+  } catch(e) {
+    alert('❌ 测试失败（账号已被自动暂停调度）:\n' + e.message);
+    loadAccounts();
+  }
+}
+
+async function resumeAccount(index) {
+  await api(`/api/accounts/${index}/resume`, { method: 'POST' });
+  loadAccounts();
+}
+
+async function pauseAccount(index) {
+  await api(`/api/accounts/${index}/pause`, { method: 'POST' });
+  loadAccounts();
+}
+
+async function loginAccount(index) {
+  try {
+    const r = await api(`/api/accounts/${index}/login`, { method: 'POST' });
+    alert('✅ 登录成功，已换取新 Token 并恢复调度！');
+    loadAccounts();
+  } catch(e) {
+    alert('❌ 自动登录失败: ' + e.message);
+    loadAccounts();
+  }
+}
+
+$('btn-testall').onclick = async () => {
+  const d = await api('/api/accounts');
+  for (let a of d.accounts) {
+    await api(`/api/accounts/${a.index}/test`, { method: 'POST' }).catch(()=>{});
+  }
+  loadAccounts();
+  alert('批量探测完成，状态已全部刷新！');
+};
+
+$('btn-newacc').onclick = () => {
+  openAccountModal('添加 DeepSeek 账号', null, async data => {
+    await api('/api/accounts', { method: 'POST', body: JSON.stringify(data) });
+    loadAccounts();
+  });
+};
+
+function editAccount(index) {
+  api('/api/accounts?reveal=1').then(d => {
+    const a = d.accounts.find(x => x.index === index);
+    if (!a) return;
+    openAccountModal('编辑账号 ' + a.name, a, async data => {
+      await api(`/api/accounts/${index}`, { method: 'PATCH', body: JSON.stringify(data) });
+      loadAccounts();
+    });
+  });
+}
+
+function delAccount(index) {
+  if (confirm('确定删除该账号吗？')) {
+    api(`/api/accounts/${index}`, { method: 'DELETE' }).then(loadAccounts);
+  }
+}
+
+function openAccountModal(title, initial, onSave) {
+  const el = document.createElement('div');
+  el.className = 'modal';
+  el.innerHTML = `
+    <div class="box">
+      <h3>${title}</h3>
+      <label>账号标识名称</label>
+      <input id="m-name" placeholder="例如: acc1" value="${initial ? esc(initial.name) : ''}">
+      <label>DeepSeek UserToken (从浏览器 chat.deepseek.com 的 localStorage 获取)</label>
+      <input id="m-token" placeholder="粘贴 token 字符串" value="${initial ? esc(initial.token) : ''}">
+      <label>备选：绑定邮箱（用于自动重登，选填）</label>
+      <input id="m-email" placeholder="you@domain.com" value="${initial ? esc(initial.email) : ''}">
+      <label>备选：绑定密码（用于自动重登，选填）</label>
+      <input id="m-pass" type="password" placeholder="密码" value="${initial ? esc(initial.password) : ''}">
+      <div class="flex" style="justify-content:flex-end;margin-top:18px">
+        <button class="btn" id="m-cancel">取消</button>
+        <button class="btn primary" id="m-save">保存</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(el);
+  el.querySelector('#m-cancel').onclick = () => el.remove();
+  el.querySelector('#m-save').onclick = async () => {
+    const data = {
+      name: el.querySelector('#m-name').value,
+      token: el.querySelector('#m-token').value,
+      email: el.querySelector('#m-email').value,
+      password: el.querySelector('#m-pass').value,
+    };
+    await onSave(data);
+    el.remove();
+  };
+}
+
+// ---------- 持久请求日志 ----------
+let currentLogStatus = 'all';
+async function loadLogs() {
+  const d = await api(`/api/logs?status=${currentLogStatus}&limit=100`);
+  $('log-count').textContent = `显示最近 ${d.logs.length} 条持久日志`;
+  $('full-logs').innerHTML = d.logs.length ? '<table><thead><tr>' +
+    ['时间','请求ID','端点','账号','模型','状态','耗时','输入 Token','输出 Token','错误原因'].map(h => '<th>'+h+'</th>').join('') +
+    '</tr></thead><tbody>' + d.logs.map(q => `<tr>
+      <td class="muted">${fmtTime(q.at)}</td>
+      <td><code>${esc(q.id)}</code></td>
+      <td><code>${esc(q.endpoint)}</code></td>
+      <td><b>${esc(q.account)}</b></td>
+      <td class="muted">${esc(q.model)}</td>
+      <td><span class="tag ${q.ok ? 't-ok' : 't-err'}">${q.status}</span></td>
+      <td>${fmtMs(q.ms)}</td>
+      <td>${q.tokens ? q.tokens.prompt : 0}</td>
+      <td>${q.tokens ? q.tokens.completion : 0}</td>
+      <td style="color:var(--err);max-width:300px;word-break:break-all">${esc(q.error || '-')}</td>
+    </tr>`).join('') + '</tbody></table>' : '<div class="empty">没有匹配的日志记录</div>';
+}
+document.querySelectorAll('.log-filter').forEach(b => b.onclick = () => {
+  document.querySelectorAll('.log-filter').forEach(x => x.classList.remove('primary'));
+  b.classList.add('primary');
+  currentLogStatus = b.dataset.status;
+  loadLogs();
+});
+
+// ---------- Token 统计 ----------
+async function loadUsage() {
+  const d = await api('/api/usage');
+  const total = d.total || {};
+  $('usage-cards').innerHTML = [
+    card('累计 Prompt Token', fmtNum(total.promptTokens), '输入 Token 累计'),
+    card('累计 Completion Token', fmtNum(total.completionTokens), '输出 Token 累计'),
+    card('累计 Thinking Token', fmtNum(total.thinkingTokens), '思维链 Token 累计'),
+    card('总 Token 消耗', fmtNum(total.totalTokens), '全部账号总计'),
+  ].join('');
+
+  const byDay = d.byDay || [];
+  $('usage-day').innerHTML = byDay.length ? '<table><thead><tr>' +
+    ['日期','请求次数','成功/失败','Prompt Tokens','Completion Tokens','Thinking Tokens','总 Token'].map(h => '<th>'+h+'</th>').join('') +
+    '</tr></thead><tbody>' + byDay.map(day => `<tr>
+      <td><b>${esc(day.date)}</b></td>
+      <td>${fmtNum(day.requests)}</td>
+      <td>${day.ok} / ${day.err}</td>
+      <td>${fmtNum(day.promptTokens)}</td>
+      <td>${fmtNum(day.completionTokens)}</td>
+      <td>${fmtNum(day.thinkingTokens)}</td>
+      <td><b>${fmtNum(day.totalTokens)}</b></td>
+    </tr>`).join('') + '</tbody></table>' : '<div class="empty">暂无按日统计</div>';
+
+  const byAcc = d.byAccount || [];
+  $('usage-acc').innerHTML = byAcc.length ? '<table><thead><tr>' +
+    ['账号名称','请求次数','成功/失败','Token 用量'].map(h => '<th>'+h+'</th>').join('') +
+    '</tr></thead><tbody>' + byAcc.map(a => `<tr>
+      <td><b>${esc(a.name)}</b></td>
+      <td>${fmtNum(a.requests)}</td>
+      <td>${a.ok} / ${a.err}</td>
+      <td><b>${fmtNum(a.totalTokens)}</b></td>
+    </tr>`).join('') + '</tbody></table>' : '<div class="empty">暂无账号统计</div>';
+}
+
+// ---------- API Key ----------
+async function loadKeys() {
+  const d = await api('/api/keys');
+  const keys = d.keys || [];
+  $('keys').innerHTML = keys.length ? '<table><thead><tr>' +
+    ['名称 / 备注','Key 密匙','状态','请求数','Token 消耗','创建时间','操作'].map(h => '<th>'+h+'</th>').join('') +
+    '</tr></thead><tbody>' + keys.map(k => `<tr>
+      <td><b>${esc(k.name)}</b><div class="muted">${esc(k.note||'')}</div></td>
+      <td><code title="点击复制" style="cursor:pointer" onclick="navigator.clipboard.writeText('${k.key}');alert('已复制 Key');">${esc(k.key.slice(0, 18))}…</code></td>
+      <td><span class="tag ${k.enabled ? 't-ok' : 't-dim'}">${k.enabled ? '启用' : '禁用'}</span></td>
+      <td>${k.stats ? k.stats.requests : 0}</td>
+      <td>${k.stats ? fmtNum(k.stats.totalTokens) : 0}</td>
+      <td class="muted">${k.createdAt.slice(0,10)}</td>
+      <td>
+        <button class="btn danger" onclick="delKey('${k.id}')">删除</button>
+      </td>
+    </tr>`).join('') + '</tbody></table>' : '<div class="empty">暂无 API Key，请点击上方创建</div>';
+}
+
+$('btn-newkey').onclick = () => {
+  const name = prompt('请输入 API Key 别名（例如: cursor-dev）:');
+  if (name) {
+    api('/api/keys', { method: 'POST', body: JSON.stringify({ name }) }).then(r => {
+      prompt('API Key 创建成功，请妥善保存（只显示一次）:', r.key.key);
+      loadKeys();
+    });
+  }
+};
+
+function delKey(id) {
+  if (confirm('确定删除该 API Key 吗？')) {
+    api(`/api/keys/${id}`, { method: 'DELETE' }).then(loadKeys);
+  }
+}
+
+// 改密
+$('btn-pw').onclick = () => {
+  const oldPw = prompt('请输入当前密码:');
+  if (!oldPw) return;
+  const newPw = prompt('请输入新密码:');
+  if (!newPw) return;
+  api('/api/change-password', { method: 'POST', body: JSON.stringify({ oldPassword: oldPw, newPassword: newPw }) })
+    .then(() => alert('密码修改成功，请牢记新密码！'))
+    .catch(e => alert('修改失败: ' + e.message));
+};
+
+$('btn-refresh').onclick = () => {
+  loadDash();
+  loadAccounts();
+};
+
+// 周期自动轮询 (每 4 秒静默刷新当前视图)
+setInterval(() => {
+  const activeNav = document.querySelector('nav button.on');
+  if (activeNav && activeNav.dataset.tab === 'dash') loadDash();
+}, 4000);
+
+// 初始化
+api('/api/me').then(() => {
+  $('login').style.display = 'none';
+  loadDash();
+}).catch(() => {
+  $('login').style.display = 'flex';
+});
+</script>
+</body>
+</html>

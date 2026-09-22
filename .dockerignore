@@ -1,0 +1,12 @@
+node_modules
+.git
+.gitignore
+.chrome-profiles
+logs/*.log
+logs/*.err.log
+data/*.tmp
+*.pid
+*.txt
+.env
+.DS_Store
+Thumbs.db

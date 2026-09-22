@@ -1,0 +1,9 @@
+node_modules/
+data/accounts.json
+data/auth-data.json
+data/stats.json
+data/requests.jsonl
+logs/
+.env
+*.log
+.chrome-profiles/

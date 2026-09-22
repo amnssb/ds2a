@@ -1,0 +1,87 @@
+{
+  "createdAt": "2026-09-20T10:49:57.673Z",
+  "mustChangePassword": true,
+  "admin": {
+    "username": "admin",
+    "salt": "f73ce7d19bba0665e4f3329eb3027612",
+    "hash": "896cd01e85d6c50d551a5602e0870984422ecf5ff6a39d860e169c82ae4ce2f9b74e88f135a4278e6e86c7aaf61516206c68c1106252cb08390aad3f98306de0",
+    "updatedAt": "2026-09-20T10:49:57.674Z"
+  },
+  "apiKeys": [
+    {
+      "id": "k_5013abc8fa30",
+      "name": "1",
+      "note": "",
+      "key": "sk-ds-432e74756b6c41326cf7f227d46c9f23500ccd2a0cf017c1",
+      "createdAt": "2026-09-20T11:04:31.324Z",
+      "lastUsedAt": "2026-09-20T11:59:35.639Z",
+      "enabled": true
+    }
+  ],
+  "sessions": {
+    "3e37258a76051ddbea807a868a885836c49230444d6060b4b762215bdb2ca87f": {
+      "username": "admin",
+      "expiresAt": 1789944676591,
+      "createdAt": "2026-09-20T10:51:16.591Z"
+    },
+    "0d2b4a1248426e668ad9536f6ccef2a956d199ed926321812e4f45fbb530a1d2": {
+      "username": "admin",
+      "expiresAt": 1789945464428,
+      "createdAt": "2026-09-20T11:04:24.428Z"
+    },
+    "0c6db68240360384734ad45105d42ff18303be7c2cbf2e0d999a43c1dd032500": {
+      "username": "admin",
+      "expiresAt": 1789946058690,
+      "createdAt": "2026-09-20T11:14:18.690Z"
+    },
+    "18e76d18aec7a3241496385cba4a3e4d2b439d90e272a9056aac283a1ff0c0c6": {
+      "username": "admin",
+      "expiresAt": 1789946074200,
+      "createdAt": "2026-09-20T11:14:34.200Z"
+    }
+  },
+  "stats": {
+    "total": {
+      "requests": 58,
+      "promptTokens": 1129194,
+      "completionTokens": 7345,
+      "thinkingTokens": 1443,
+      "ok": 58,
+      "err": 0,
+      "totalTokens": 1137982
+    },
+    "byKey": {
+      "k_5013abc8fa30": {
+        "requests": 43,
+        "promptTokens": 1128419,
+        "completionTokens": 7086,
+        "thinkingTokens": 1378,
+        "ok": 43,
+        "err": 0,
+        "totalTokens": 1136883
+      }
+    },
+    "byAccount": {
+      "acc1": {
+        "requests": 58,
+        "promptTokens": 1129194,
+        "completionTokens": 7345,
+        "thinkingTokens": 1443,
+        "ok": 58,
+        "err": 0,
+        "totalTokens": 1137982
+      }
+    },
+    "byDay": {
+      "2026-09-20": {
+        "requests": 58,
+        "promptTokens": 1129194,
+        "completionTokens": 7345,
+        "thinkingTokens": 1443,
+        "ok": 58,
+        "err": 0,
+        "totalTokens": 1137982
+      }
+    }
+  }
+}

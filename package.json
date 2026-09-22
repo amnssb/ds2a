@@ -1,0 +1,20 @@
+{
+  "name": "ds-browserless",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DeepSeek web chat -> OpenAI/Claude compatible API, browserless (pure HTTP)",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "export-token": "node get-token.js",
+    "docker:up": "docker compose up -d --build",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f --tail 100",
+    "docker:restart": "docker compose restart"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "ws": "^8.21.3"
+  }
+}

@@ -1,0 +1,19 @@
+[
+  {
+    "name": "acc1",
+    "email": "your@email.com",
+    "password": "your-password",
+    "autoLogin": true
+  },
+  {
+    "name": "acc2",
+    "mobile": "13800138000",
+    "areaCode": "+86",
+    "password": "your-password",
+    "autoLogin": true
+  },
+  {
+    "name": "acc3",
+    "token": "也可以继续手动贴 get-token.js 导出的 token（不填邮箱密码时走这条）"
+  }
+]
