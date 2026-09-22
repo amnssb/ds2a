@@ -103,7 +103,7 @@ docker build -t ds2a:latest .
 # 启动容器并挂载数据目录
 docker run -d \
   --name ds-gateway \
-  -p 34868:34868 \
+  -p 19728:19728 \
   -v $(pwd)/data:/app/data \
   -v $(pwd)/logs:/app/logs \
   --restart always \
@@ -149,7 +149,7 @@ node server.js
 
 | 配置项 / 环境变量 | 默认值 | 说明 |
 |-------------------|--------|------|
-| `PORT` | `34868` | 网关监听端口 |
+| `PORT` | `19728` | 网关监听端口 |
 | `HOST` | `0.0.0.0` | 网关监听 IP 地址 |
 | `DATA_DIR` | `./data` | 持久化数据存储路径 |
 | `LOG_DIR` | `./logs` | 日志轮转存储路径 |
@@ -196,7 +196,7 @@ node server.js
 ### 1. OpenAI 格式端点 (`POST /v1/chat/completions`)
 
 ```bash
-curl http://127.0.0.1:34868/v1/chat/completions \
+curl http://127.0.0.1:19728/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-your-api-key" \
   -d '{
@@ -212,7 +212,7 @@ curl http://127.0.0.1:34868/v1/chat/completions \
 ### 2. Claude 格式端点 (`POST /v1/messages`)
 
 ```bash
-curl http://127.0.0.1:34868/v1/messages \
+curl http://127.0.0.1:19728/v1/messages \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-your-api-key" \
   -d '{
@@ -226,9 +226,9 @@ curl http://127.0.0.1:34868/v1/messages \
 
 ### 3. Web Dashboard 管理后台
 
-在浏览器打开：`http://127.0.0.1:34868/panel/`
+在浏览器打开：`http://127.0.0.1:19728/panel/`
 - **默认管理员账号**：`admin`
-- **默认管理员密码**：`admin`
+- **默认管理员密码**：`admin123`
 
 在此面板中可以实时查看账号健康度、连通性探测、在线配置 API Key 以及查看持久化统计图表喵。
 

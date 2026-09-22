@@ -25,7 +25,7 @@
 - **全局 Token 计量**：持久化按天、按账号、按 API Key 统计 Prompt / Completion / Thinking Token 用量。
 
 ### 4. 增强型现代控制台 (Web Dashboard)
-- 访问：`http://127.0.0.1:34868/panel/`（默认凭证：`admin` / `admin`）。
+- 访问：`http://127.0.0.1:19728/panel/`（默认凭证：`admin` / `admin123`）。
 - **账号调度中心**：支持一键连通性探测、手动暂停/恢复、自动重登、实时并发负载展示。
 - **日志审计面板**：支持按成功/失败过滤历史请求，实时查看失败堆栈与诊断信息。
 - **Token 资产大盘**：日度消耗曲线与各账号配额分析。
@@ -118,7 +118,7 @@ docker-compose logs -f
 ### 1. OpenAI 格式兼容 (`POST /v1/chat/completions`)
 
 ```bash
-curl http://127.0.0.1:34868/v1/chat/completions \
+curl http://127.0.0.1:19728/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "deepseek-v4.1-flash",
@@ -131,7 +131,7 @@ curl http://127.0.0.1:34868/v1/chat/completions \
 ### 2. Claude 格式兼容 (`POST /v1/messages`)
 
 ```bash
-curl http://127.0.0.1:34868/v1/messages \
+curl http://127.0.0.1:19728/v1/messages \
   -H "Content-Type: application/json" \
   -d '{
     "model": "claude-3-5-sonnet",

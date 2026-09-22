@@ -9,13 +9,13 @@ services:
     container_name: ds-gateway
     restart: unless-stopped
     ports:
-      - "${PORT:-34868}:34868"
+      - "${PORT:-19728}:19728"
     env_file:
       - .env
     environment:
       - NODE_ENV=production
       - HOST=0.0.0.0
-      - PORT=34868
+      - PORT=19728
     volumes:
       # 持久化挂载：配置文件、Token 统计与历史日志保存在宿主机项目目录下
       - ./data:/app/data
@@ -34,7 +34,7 @@ services:
         max-size: "20m"
         max-file: "5"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:34868/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:19728/health || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 3

@@ -67,12 +67,12 @@ module.exports = {
     assertNotCDrive,
 
     // 服务网络配置
-    PORT: Number(process.env.PORT || 34868),
+    PORT: Number(process.env.PORT || 19728),
     HOST: process.env.HOST || '127.0.0.1',
 
     // 管理员认证
     ADMIN_USER: process.env.DS_ADMIN_USER || 'admin',
-    ADMIN_PASS: process.env.DS_ADMIN_PASS || 'admin',
+    ADMIN_PASS: process.env.DS_ADMIN_PASS || 'admin123',
     REQUIRE_KEY: process.env.DS_REQUIRE_KEY === 'true',
 
     // 会话与超时
