@@ -66,9 +66,9 @@ module.exports = {
     WASM_FILE,
     assertNotCDrive,
 
-    // 服务网络配置
+    // 服务网络配置（0.0.0.0 允许公网或局域网远程访问）
     PORT: Number(process.env.PORT || 19728),
-    HOST: process.env.HOST || '127.0.0.1',
+    HOST: process.env.HOST || '0.0.0.0',
 
     // 管理员认证
     ADMIN_USER: process.env.DS_ADMIN_USER || 'admin',

@@ -15,8 +15,8 @@ module.exports = {
         max_memory_restart: '800M',
         env: {
             NODE_ENV: 'production',
-            PORT: 34868,
-            HOST: '127.0.0.1',
+            PORT: 19728,
+            HOST: '0.0.0.0',
             DS_DATA_DIR: path.join(__dirname, 'data'),
             DS_LOGS_DIR: path.join(__dirname, 'logs'),
         },

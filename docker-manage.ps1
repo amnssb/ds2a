@@ -24,8 +24,8 @@ switch ($Action.ToLower()) {
     'up' {
         Write-Host "Starting DeepSeek Gateway container ..." -ForegroundColor Cyan
         docker compose up -d --build
-        Write-Host "Container started! API: http://127.0.0.1:34868/v1/chat/completions" -ForegroundColor Green
-        Write-Host "Dashboard: http://127.0.0.1:34868/panel/" -ForegroundColor Green
+        Write-Host "Container started! API: http://127.0.0.1:19728/v1/chat/completions" -ForegroundColor Green
+        Write-Host "Dashboard: http://127.0.0.1:19728/panel/" -ForegroundColor Green
     }
     'down' {
         Write-Host "Stopping DeepSeek Gateway container ..." -ForegroundColor Cyan
@@ -45,7 +45,7 @@ switch ($Action.ToLower()) {
         docker compose ps
         Write-Host "--------------------------------------------------" -ForegroundColor DarkCyan
         try {
-            $h = Invoke-RestMethod -Uri 'http://127.0.0.1:34868/health' -TimeoutSec 3
+            $h = Invoke-RestMethod -Uri 'http://127.0.0.1:19728/health' -TimeoutSec 3
             Write-Host "Gateway Health: $($h.status) | Healthy Accounts: $($h.healthyAccounts)/$($h.totalAccounts)" -ForegroundColor Green
         } catch {
             Write-Host "Gateway Health Check: Container starting or stopped" -ForegroundColor Yellow

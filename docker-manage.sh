@@ -17,8 +17,8 @@ case "$ACTION" in
         echo "Starting DeepSeek Gateway container in background..."
         docker compose up -d --build
         echo "Container started!"
-        echo "OpenAI API: http://127.0.0.1:34868/v1/chat/completions"
-        echo "Dashboard:  http://127.0.0.1:34868/panel/"
+        echo "OpenAI API: http://127.0.0.1:19728/v1/chat/completions"
+        echo "Dashboard:  http://127.0.0.1:19728/panel/"
         ;;
     down)
         echo "Stopping DeepSeek Gateway container..."
@@ -37,7 +37,7 @@ case "$ACTION" in
         echo "================ Container Status ================"
         docker compose ps
         echo "--------------------------------------------------"
-        if curl -fsS http://127.0.0.1:34868/health >/dev/null 2>&1; then
+        if curl -fsS http://127.0.0.1:19728/health >/dev/null 2>&1; then
             echo "Gateway Service: Healthy"
         else
             echo "Gateway Service: Not reachable"

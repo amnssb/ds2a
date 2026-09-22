@@ -20,7 +20,7 @@ RUN apk add --no-cache tini tzdata curl \
 
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
-ENV PORT=34868
+ENV PORT=19728
 
 # 创建持久化数据与日志挂载目录并赋予 node 用户权限
 RUN mkdir -p /app/data /app/logs /app/vendor && chown -R node:node /app
@@ -36,11 +36,11 @@ USER node
 VOLUME ["/app/data", "/app/logs"]
 
 # 对外暴露服务端口
-EXPOSE 34868
+EXPOSE 19728
 
 # 原生健康检查探测
 HEALTHCHECK --interval=20s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:34868/health || exit 1
+  CMD curl -fsS http://127.0.0.1:19728/health || exit 1
 
 ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["node", "server.js"]

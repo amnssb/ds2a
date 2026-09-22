@@ -39,13 +39,13 @@ function Show-Status {
         Write-Host "  DeepSeek Gateway: [RUNNING]" -ForegroundColor Green
         Write-Host "  PID:         $($p.Id) (Memory: ${wsMb} MB)"
         Write-Host "  Started:     $($p.StartTime)"
-        Write-Host "  OpenAI API:  http://127.0.0.1:34868/v1/chat/completions"
-        Write-Host "  Claude API:  http://127.0.0.1:34868/v1/messages"
-        Write-Host "  Dashboard:   http://127.0.0.1:34868/panel/"
+        Write-Host "  OpenAI API:  http://127.0.0.1:19728/v1/chat/completions"
+        Write-Host "  Claude API:  http://127.0.0.1:19728/v1/messages"
+        Write-Host "  Dashboard:   http://127.0.0.1:19728/panel/"
         Write-Host "----------------------------------------------------------" -ForegroundColor DarkCyan
 
         try {
-            $h = Invoke-RestMethod -Uri 'http://127.0.0.1:34868/health' -TimeoutSec 4
+            $h = Invoke-RestMethod -Uri 'http://127.0.0.1:19728/health' -TimeoutSec 4
             $wasmTxt = if ($h.wasmAcceleration) { "Active (85ms/100k difficulty)" } else { "JS Fallback" }
             Write-Host "  WASM Acceleration: $wasmTxt" -ForegroundColor Cyan
             Write-Host "  Accounts: $($h.healthyAccounts) / $($h.totalAccounts) Healthy"
@@ -117,7 +117,7 @@ function Test-Api {
         }
         $body = ConvertTo-Json -InputObject $bodyObj
 
-        $resp = Invoke-RestMethod -Uri 'http://127.0.0.1:34868/v1/chat/completions' `
+        $resp = Invoke-RestMethod -Uri 'http://127.0.0.1:19728/v1/chat/completions' `
             -Method POST -Body $body -ContentType 'application/json' -TimeoutSec 30
 
         $cost = [math]::Round(((Get-Date) - $t0).TotalMilliseconds)

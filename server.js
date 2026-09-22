@@ -136,11 +136,12 @@ function setupGracefulShutdown(server) {
 
 // 7. 启动服务监听
 const server = app.listen(config.PORT, config.HOST, () => {
-    logger.ok('🚀 DeepSeek 智能网关已启动（工业级优化版）');
-    logger.info(`OpenAI 接口:  http://${config.HOST}:${config.PORT}/v1/chat/completions`);
-    logger.info(`Claude 接口:  http://${config.HOST}:${config.PORT}/v1/messages`);
-    logger.info(`管理控制台:   http://${config.HOST}:${config.PORT}/panel/`);
-    logger.info(`健康状态:     http://${config.HOST}:${config.PORT}/health`);
+    const displayHost = config.HOST === '0.0.0.0' ? '127.0.0.1' : config.HOST;
+    logger.ok(`🚀 DeepSeek 智能网关已启动（端口: ${config.PORT}，监听: ${config.HOST}）`);
+    logger.info(`OpenAI 接口:  http://${displayHost}:${config.PORT}/v1/chat/completions`);
+    logger.info(`Claude 接口:  http://${displayHost}:${config.PORT}/v1/messages`);
+    logger.info(`管理控制台:   http://${displayHost}:${config.PORT}/panel/`);
+    logger.info(`健康状态:     http://${displayHost}:${config.PORT}/health`);
     logger.info(`WASM 硬件加速: ${powEngine.isWasmReady() ? '已启用 (85ms/10万次)' : '未启用 (纯 JS 兜底)'}`);
     logger.info(`数据持久化:   ${config.DATA_DIR}`);
 
