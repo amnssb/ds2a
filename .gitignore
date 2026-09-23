@@ -11,3 +11,10 @@ logs/
 *.log
 *.pid
 .chrome-profiles/
+askpass.bat
+data/studio-config.json
+data/studio-status.json
+data/studio.out
+data/studio.err
+data/token-push-result.json
+*.tmp

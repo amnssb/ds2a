@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>本机账号 Studio</title>
+<style>
+  :root {
+    --bg:#090d13; --panel:#121820; --panel2:#182230; --line:#222f42;
+    --fg:#e2e8f0; --dim:#7f8ea3; --accent:#3b82f6; --ok:#10b981;
+    --warn:#f59e0b; --err:#ef4444; --purple:#8b5cf6;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--fg);
+    font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  header {
+    display:flex; align-items:center; gap:14px; padding:12px 20px;
+    background:var(--panel); border-bottom:1px solid var(--line);
+    position:sticky; top:0; z-index:10;
+  }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  header .meta { color:var(--dim); font-size:12px; }
+  header .right { margin-left:auto; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  main { padding:16px 20px 40px; max-width:1400px; margin:0 auto; }
+  .card {
+    background:var(--panel); border:1px solid var(--line); border-radius:10px;
+    padding:14px 16px; margin-bottom:14px;
+  }
+  .card h2 { font-size:13px; margin:0 0 10px; color:var(--dim); font-weight:600; letter-spacing:.04em; text-transform:uppercase; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  button {
+    background:var(--panel2); color:var(--fg); border:1px solid var(--line);
+    border-radius:8px; padding:7px 12px; cursor:pointer; font-size:13px;
+  }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.primary:hover { filter:brightness(1.08); }
+  button.danger { background:#7f1d1d; border-color:#991b1b; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  input, textarea, select {
+    background:var(--panel2); color:var(--fg); border:1px solid var(--line);
+    border-radius:8px; padding:7px 10px; font-size:13px; outline:none;
+  }
+  input:focus, textarea:focus { border-color:var(--accent); }
+  textarea { width:100%; min-height:90px; font-family:ui-monospace,Consolas,monospace; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th, td { padding:8px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:middle; }
+  th { color:var(--dim); font-weight:600; background:var(--panel2); position:sticky; top:0; }
+  tr:hover td { background:rgba(59,130,246,.06); }
+  .badge {
+    display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px;
+    background:#1e293b; color:var(--dim); border:1px solid var(--line);
+  }
+  .badge.ok { background:#064e3b; color:#34d399; border-color:#065f46; }
+  .badge.warn { background:#78350f; color:#fbbf24; border-color:#92400e; }
+  .badge.err { background:#7f1d1d; color:#fca5a5; border-color:#991b1b; }
+  .badge.off { background:#3f3f46; color:#a1a1aa; border-color:#52525b; }
+  .badge.sync { background:#1e3a5f; color:#93c5fd; border-color:#1d4ed8; }
+  #log {
+    background:#0b1220; border:1px solid var(--line); border-radius:8px;
+    padding:10px; height:180px; overflow:auto; font-family:ui-monospace,Consolas,monospace;
+    font-size:12px; color:#a5b4c8; white-space:pre-wrap;
+  }
+  .muted { color:var(--dim); }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:900px){ .grid2 { grid-template-columns:1fr; } }
+  .cfg label { display:block; color:var(--dim); font-size:12px; margin:8px 0 4px; }
+  .cfg input { width:100%; }
+  #conn { font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>本机账号 Studio</h1>
+  <span class="meta" id="meta">批量管理 · 换 Token · 上行同步 · 状态下发</span>
+  <span id="conn" class="badge">连接中…</span>
+  <div class="right">
+    <span class="meta" id="jobBadge">空闲</span>
+    <button class="primary" id="btnToken">批量换 Token</button>
+    <button id="btnPush">上行同步</button>
+    <button id="btnPull">拉取状态</button>
+  </div>
+</header>
+
+<main>
+  <div class="card">
+    <h2>服务端连接（反代）</h2>
+    <div class="cfg" style="display:grid;grid-template-columns:2fr 1fr 1fr auto;gap:10px;align-items:end">
+      <div>
+        <label>Remote Base</label>
+        <input id="cfgBase" placeholder="http://127.0.0.1:19728">
+      </div>
+      <div>
+        <label>用户</label>
+        <input id="cfgUser" autocomplete="off">
+      </div>
+      <div>
+        <label>密码</label>
+        <input id="cfgPass" type="password" autocomplete="new-password" placeholder="不改请留空 ****">
+      </div>
+      <div class="row">
+        <button id="btnSaveCfg">保存</button>
+        <button id="btnTestConn">测试连接</button>
+      </div>
+    </div>
+    <div class="muted" style="margin-top:8px">
+      上行只传 账密/Token/deviceId；服务端权威保留 disabled，状态经 SSE/拉取下发到本机显示喵
+    </div>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <h2>批量导入（每行: name,email,password）</h2>
+      <textarea id="importText" placeholder="acc10,user@x.com,pass123&#10;acc11,user2@x.com,pass456"></textarea>
+      <div class="row" style="margin-top:8px">
+        <button id="btnImport" class="primary">导入 / 更新</button>
+        <span class="muted">也支持 JSON 数组</span>
+      </div>
+    </div>
+    <div class="card">
+      <h2>任务选项</h2>
+      <div class="row">
+        <label><input type="checkbox" id="optHeadful"> 有头浏览器（默认无头）</label>
+        <label><input type="checkbox" id="optPushAfter" checked> 换完自动上行</label>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button id="btnTokenSel" class="primary">仅处理勾选</button>
+        <button id="btnClearSel">取消勾选</button>
+      </div>
+      <div id="log" style="margin-top:10px"></div>
+    </div>
+  </div>
+
+  <div class="card" style="padding:0; overflow:auto">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:36px"><input type="checkbox" id="chkAll"></th>
+          <th>账号</th>
+          <th>邮箱</th>
+          <th>本地 Token</th>
+          <th>服务端状态</th>
+          <th>禁用(权威)</th>
+          <th>健康</th>
+          <th>失败/成功</th>
+          <th>最近错误</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+let rows = [];
+let jobTimer = null;
+let evt = null;
+
+function badge(text, cls) {
+  return '<span class="badge ' + (cls||'') + '">' + escapeHtml(text) + '</span>';
+}
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  })[c]);
+}
+
+function stateBadge(r) {
+  if (!r.remote) return badge('未同步', 'off');
+  const s = r.remote;
+  if (s.disabled) return badge('已禁用', 'off');
+  if (s.state === 'paused') return badge('暂停', 'warn');
+  if (s.state === 'cooldown') return badge('冷却 ' + (s.cooldownSec||'') , 'warn');
+  if (s.state === 'auth_failed') return badge('鉴权失败', 'err');
+  if (s.healthy) return badge('healthy', 'ok');
+  return badge(s.state || '未知', 'warn');
+}
+
+function render() {
+  const tb = $('#tbody');
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="10" class="muted" style="padding:20px;text-align:center">暂无本地账号，请先导入喵</td></tr>';
+    return;
+  }
+  tb.innerHTML = rows.map((r, i) => {
+    const rem = r.remote;
+    const dis = rem ? rem.disabled : false;
+    return '<tr data-name="' + escapeHtml(r.name) + '">' +
+      '<td><input type="checkbox" class="chk" data-name="' + escapeHtml(r.name) + '"></td>' +
+      '<td><b>' + escapeHtml(r.name) + '</b></td>' +
+      '<td class="muted">' + escapeHtml(r.email || r.mobile || '-') + '</td>' +
+      '<td>' + (r.hasLocalToken ? badge(r.localTokenPreview, 'ok') : badge('无', 'off')) +
+        (r.lastLoginAt ? '<div class="muted" style="font-size:11px">' + escapeHtml(r.lastLoginAt.slice(0,19).replace('T',' ')) + '</div>' : '') +
+      '</td>' +
+      '<td>' + stateBadge(r) +
+        (rem && rem.hasToken ? ' ' + badge('S Token', 'sync') : '') +
+      '</td>' +
+      '<td>' + (dis ? badge('禁用中', 'err') : badge('启用', 'ok')) + '</td>' +
+      '<td>' + (rem ? (rem.healthy ? badge('健康','ok') : badge('异常','err')) : badge('-','off')) + '</td>' +
+      '<td class="muted">' + (rem ? (rem.err + ' / ' + rem.ok) : '-') + '</td>' +
+      '<td class="muted" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' +
+        escapeHtml((rem && rem.lastError) || r.lastLoginError || '') + '">' +
+        escapeHtml((rem && rem.lastError) || r.lastLoginError || '-') + '</td>' +
+      '<td class="row" style="gap:6px">' +
+        '<button data-act="dis" data-name="' + escapeHtml(r.name) + '" data-v="1"' + (dis?' disabled':'') + '>禁用</button>' +
+        '<button data-act="dis" data-name="' + escapeHtml(r.name) + '" data-v="0"' + (dis?'':' disabled')+'>启用</button>' +
+        '<button data-act="del" data-name="' + escapeHtml(r.name) + '">删</button>' +
+      '</td>' +
+    '</tr>';
+  }).join('');
+}
+
+async function api(url, opt) {
+  const r = await fetch(url, Object.assign({ headers: { 'content-type': 'application/json' } }, opt || {}));
+  const text = await r.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  if (!r.ok) throw new Error(data.error || data.raw || ('HTTP ' + r.status));
+  return data;
+}
+
+async function loadRows() {
+  const d = await api('/api/rows');
+  rows = d.rows || [];
+  $('#meta').textContent = '本地 ' + d.total + ' 个 · 状态镜像 ' + (d.at ? new Date(d.at).toLocaleTimeString() : '无');
+  render();
+}
+
+async function loadCfg() {
+  const c = await api('/api/config');
+  $('#cfgBase').value = c.remoteBase || '';
+  $('#cfgUser').value = c.remoteUser || '';
+  $('#cfgPass').value = '';
+  $('#optHeadful').checked = !!c.headful;
+}
+
+function logLine(s) {
+  const el = $('#log');
+  el.textContent += s + '\n';
+  el.scrollTop = el.scrollHeight;
+}
+
+function setJobBadge(j) {
+  if (!j || !j.running) {
+    $('#jobBadge').textContent = j && j.result ? ('完成 ok=' + (j.ok||0) + ' fail=' + (j.fail||0)) : '空闲';
+    $('#btnToken').disabled = false;
+    $('#btnTokenSel').disabled = false;
+    $('#btnPush').disabled = false;
+    return;
+  }
+  $('#jobBadge').textContent = (j.kind === 'push' ? '推送中' : '换Token') + ' ' + j.done + '/' + j.total +
+    (j.current ? ' · ' + j.current : '');
+  $('#btnToken').disabled = true;
+  $('#btnTokenSel').disabled = true;
+  $('#btnPush').disabled = true;
+  if (j.log && j.log.length) {
+    const last = j.log[j.log.length - 1];
+    if (elLast !== last) { elLast = last; logLine(last); }
+  }
+}
+let elLast = '';
+
+async function pollJob() {
+  try {
+    const j = await api('/api/job');
+    setJobBadge(j);
+    if (j.running) {
+      if (!jobTimer) jobTimer = setInterval(pollJob, 1200);
+    } else if (jobTimer) {
+      clearInterval(jobTimer);
+      jobTimer = null;
+      loadRows();
+    }
+  } catch (e) {}
+}
+
+function connectSSE() {
+  if (evt) { try { evt.close(); } catch(e){} }
+  evt = new EventSource('/api/events');
+  evt.addEventListener('hello', () => { $('#conn').textContent = '本机 Studio 已连接'; $('#conn').className = 'badge ok'; });
+  evt.addEventListener('job', (ev) => {
+    try { setJobBadge(JSON.parse(ev.data)); } catch (e) {}
+  });
+  evt.addEventListener('rows', async (ev) => {
+    try {
+      const d = JSON.parse(ev.data);
+      rows = d.rows || rows;
+      render();
+      $('#meta').textContent = '本地 ' + rows.length + ' 个 · 服务端状态 ' +
+        (d.at ? new Date(d.at).toLocaleTimeString() : '-');
+    } catch (e) {}
+  });
+  evt.addEventListener('status', () => {
+    loadRows().catch(() => {});
+  });
+  evt.onerror = () => { $('#conn').textContent = 'SSE 重连中…'; $('#conn').className = 'badge warn'; };
+}
+
+// actions
+$('#btnSaveCfg').onclick = async () => {
+  try {
+    const body = { remoteBase: $('#cfgBase').value.trim(), remoteUser: $('#cfgUser').value.trim() };
+    if ($('#cfgPass').value) body.remotePass = $('#cfgPass').value;
+    body.headful = $('#optHeadful').checked;
+    await api('/api/config', { method: 'POST', body: JSON.stringify(body) });
+    $('#cfgPass').value = '';
+    logLine('配置已保存');
+  } catch (e) { alert(e.message); }
+};
+
+$('#btnTestConn').onclick = async () => {
+  try {
+    await $('#btnSaveCfg').onclick();
+    const r = await api('/api/job/pull', { method: 'POST', body: '{}' });
+    logLine('连接成功，拉到 ' + r.count + ' 个服务端状态');
+    await loadRows();
+    $('#conn').textContent = '服务端 OK';
+    $('#conn').className = 'badge ok';
+  } catch (e) {
+    $('#conn').textContent = '服务端失败';
+    $('#conn').className = 'badge err';
+    alert(e.message);
+  }
+};
+
+$('#btnImport').onclick = async () => {
+  try {
+    const r = await api('/api/accounts/import', {
+      method: 'POST',
+      body: JSON.stringify({ text: $('#importText').value }),
+    });
+    logLine('导入 ' + r.added + ' 个' + (r.errors.length ? ' 失败 ' + r.errors.join(',') : ''));
+    await loadRows();
+  } catch (e) { alert(e.message); }
+};
+
+async function startToken(names) {
+  try {
+    const body = {
+      headful: $('#optHeadful').checked,
+      pushAfter: $('#optPushAfter').checked,
+    };
+    if (names) body.names = names;
+    const j = await api('/api/job/token', { method: 'POST', body: JSON.stringify(body) });
+    setJobBadge(j);
+    if (!jobTimer) jobTimer = setInterval(pollJob, 1200);
+  } catch (e) { alert(e.message); }
+}
+
+$('#btnToken').onclick = () => startToken(null);
+$('#btnTokenSel').onclick = () => {
+  const names = [...document.querySelectorAll('.chk:checked')].map(c => c.dataset.name);
+  if (!names.length) return alert('先勾选账号');
+  startToken(names);
+};
+$('#btnClearSel').onclick = () => {
+  document.querySelectorAll('.chk').forEach(c => { c.checked = false; });
+  const all = $('#chkAll'); if (all) all.checked = false;
+};
+$('#chkAll').onchange = (e) => {
+  document.querySelectorAll('.chk').forEach(c => { c.checked = e.target.checked; });
+};
+
+$('#btnPush').onclick = async () => {
+  try {
+    const j = await api('/api/job/push', { method: 'POST', body: '{}' });
+    setJobBadge(j);
+    (j.log || []).forEach(logLine);
+    await loadRows();
+  } catch (e) { alert(e.message); }
+};
+
+$('#btnPull').onclick = async () => {
+  try {
+    const r = await api('/api/job/pull', { method: 'POST', body: '{}' });
+    logLine('拉取状态 ' + r.count + ' 条');
+    await loadRows();
+  } catch (e) { alert(e.message); }
+};
+
+$('#tbody').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  const name = btn.dataset.name;
+  try {
+    if (btn.dataset.act === 'del') {
+      if (!confirm('删除本地账号 ' + name + ' ?')) return;
+      await api('/api/accounts/' + encodeURIComponent(name), { method: 'DELETE' });
+      await loadRows();
+    } else if (btn.dataset.act === 'dis') {
+      const disabled = btn.dataset.v === '1';
+      await api('/api/remote-disable', {
+        method: 'POST',
+        body: JSON.stringify({ name, disabled }),
+      });
+      logLine((disabled ? '禁用 ' : '启用 ') + name + '（服务端权威）');
+      await loadRows();
+    }
+  } catch (e) { alert(e.message); }
+});
+
+(async function init() {
+  await loadCfg().catch(() => {});
+  await loadRows().catch(e => logLine('加载失败: ' + e.message));
+  connectSSE();
+  pollJob();
+  // 自动拉一次状态
+  api('/api/job/pull', { method: 'POST', body: '{}' }).then(() => loadRows()).catch(() => {});
+})();
+</script>
+</body>
+</html>

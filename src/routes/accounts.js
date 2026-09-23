@@ -88,6 +88,66 @@ router.delete('/api/accounts/:index', (req, res) => {
     res.json(r);
 });
 
+// ========== 本地 Studio 同步协议 ==========
+
+// 轻量状态快照（本机/其他客户端轮询或首屏）
+router.get('/api/accounts/status', (req, res) => {
+    res.json({ at: new Date().toISOString(), accounts: accountPool.statusSnapshot() });
+});
+
+// SSE：服务端状态变更下发（禁用/熔断/Token 更新）
+router.get('/api/accounts/events', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders && res.flushHeaders();
+
+    const send = (event, data) => {
+        try {
+            res.write('event: ' + event + '\n');
+            res.write('data: ' + JSON.stringify(data) + '\n\n');
+        } catch (e) {}
+    };
+
+    send('hello', { at: Date.now(), accounts: accountPool.statusSnapshot() });
+
+    const onChange = (payload) => send('status', payload);
+    accountPool.on('change', onChange);
+    const ping = setInterval(() => {
+        try { res.write(': ping\n\n'); } catch (e) {}
+    }, 15000);
+
+    req.on('close', () => {
+        clearInterval(ping);
+        accountPool.off('change', onChange);
+    });
+});
+
+// 批量上行：本地批量管理 + 换 Token 后一次同步
+// 语义：身份/账密/Token 以客户端为准；disabled 以服务端为准（除非 forceDisabled）
+router.post('/api/accounts/sync', (req, res) => {
+    const body = req.body || {};
+    const items = Array.isArray(body.accounts) ? body.accounts : (Array.isArray(body) ? body : null);
+    if (!items) return res.status(400).json({ ok: false, error: '缺少 accounts 数组' });
+    if (items.length > 500) return res.status(400).json({ ok: false, error: '单次最多 500 个账号' });
+    const r = accountPool.syncFromClient(items);
+    if (!r.ok) return res.status(400).json(r);
+    logger.info(`Studio 同步: +${r.created} ~${r.updated} 共${r.total}`);
+    res.json({ ...r, at: new Date().toISOString() });
+});
+
+// 服务端权威：禁用 / 启用（下发给本机显示）
+router.post('/api/accounts/:index/disable', (req, res) => {
+    const r = accountPool.setDisabled(Number(req.params.index), true);
+    if (!r.ok) return res.status(400).json(r);
+    res.json(r);
+});
+router.post('/api/accounts/:index/enable', (req, res) => {
+    const r = accountPool.setDisabled(Number(req.params.index), false);
+    if (!r.ok) return res.status(400).json(r);
+    res.json(r);
+});
+
 // 手动暂停调度
 router.post('/api/accounts/:index/pause', (req, res) => {
     const idx = Number(req.params.index);

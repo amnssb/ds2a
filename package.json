@@ -7,7 +7,9 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "studio": "node studio/server.js",
     "export-token": "node get-token.js",
+    "push-tokens": "node push-tokens-headful.js",
     "docker:up": "docker compose up -d --build",
     "docker:down": "docker compose down",
     "docker:logs": "docker compose logs -f --tail 100",

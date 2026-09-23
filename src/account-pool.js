@@ -9,6 +9,7 @@
  */
 const fs = require('fs');
 const path = require('path');
+const { EventEmitter } = require('events');
 const config = require('./config');
 const logger = require('./logger');
 
@@ -146,7 +147,12 @@ class AccountPool {
 
             // 如果 Token 改变了，自动重置故障状态
             const isPaused = tokenChanged ? false : !!item.paused;
-            const state = item.disabled ? STATUS.DISABLED : (isPaused ? STATUS.PAUSED : STATUS.HEALTHY);
+            let state;
+            if (tokenChanged) state = STATUS.HEALTHY;
+            else if (item.disabled) state = STATUS.DISABLED;
+            else if (isPaused) state = STATUS.PAUSED;
+            else if (prev && prev.state !== STATUS.DISABLED && prev.state !== STATUS.PAUSED) state = prev.state;
+            else state = STATUS.HEALTHY;
 
             return {
                 index: i,
@@ -160,7 +166,7 @@ class AccountPool {
                 autoLogin: item.autoLogin !== false,
                 disabled: !!item.disabled,
                 paused: isPaused,
-                state: prev ? (tokenChanged ? STATUS.HEALTHY : prev.state) : state,
+                state,
                 disabledUntil: (prev && !tokenChanged) ? prev.disabledUntil : 0,
                 failures: (prev && !tokenChanged) ? prev.failures : 0,
                 okCount: prev ? prev.okCount : 0,
@@ -497,6 +503,152 @@ class AccountPool {
             lastError: a.lastError,
         }));
     }
+
+    /** 供本地 Studio 下发的状态快照（服务端权威：disabled/paused/运行态） */
+    statusSnapshot() {
+        const now = Date.now();
+        const poolByName = new Map(this.accounts.map(a => [a.name, a]));
+        return this.readRaw().map((a, i) => {
+            const name = a.name || ('acc' + (i + 1));
+            const p = poolByName.get(name) || this.accounts[i];
+            return {
+                index: i,
+                name,
+                disabled: !!a.disabled,
+                paused: !!(p ? p.paused : a.paused),
+                state: p ? p.state : (a.disabled ? 'disabled' : (a.paused ? 'paused' : 'healthy')),
+                healthy: p ? (p.state === STATUS.HEALTHY && now >= p.disabledUntil) : !a.disabled,
+                hasToken: !!a.token,
+                hasPassword: !!a.password,
+                email: a.email || '',
+                mobile: a.mobile || '',
+                failures: p ? p.failures : 0,
+                ok: p ? p.okCount : 0,
+                err: p ? p.errCount : 0,
+                inflight: p ? p.inflight : 0,
+                cooldownSec: p ? Math.max(0, Math.round((p.disabledUntil - now) / 1000)) : 0,
+                lastError: p ? p.lastError : (a.lastLoginError || ''),
+                lastLoginAt: a.lastLoginAt || '',
+                lastUsedAt: p ? p.lastUsedAt : 0,
+                deviceId: a.deviceId || '',
+            };
+        });
+    }
+
+    /**
+     * 本地 Studio 批量上行：只同步身份/账密/Token/deviceId。
+     * disabled 是服务端权威字段，上行默认不覆盖（除非 item.forceDisabled）。
+     */
+    syncFromClient(items) {
+        if (!Array.isArray(items)) return { ok: false, error: 'accounts 必须是数组' };
+        const raw = this.readRaw();
+        const byName = new Map(raw.map((a, i) => [String(a.name || ''), i]));
+        let created = 0;
+        let updated = 0;
+
+        const cleanToken = (t) => {
+            let token = String(t || '').trim();
+            if (token.startsWith('{')) {
+                try {
+                    const o = JSON.parse(token);
+                    const v = o && (o.value ?? o.token ?? o.user_token);
+                    token = (v && String(v).trim() && String(v) !== 'null') ? String(v).trim() : '';
+                } catch (e) { token = ''; }
+            }
+            if (token === 'null' || token === 'undefined') token = '';
+            return token;
+        };
+
+        for (const item of items) {
+            if (!item || typeof item !== 'object') continue;
+            const name = String(item.name || '').trim();
+            if (!name) continue;
+            const token = cleanToken(item.token);
+            const email = item.email !== undefined ? String(item.email || '').trim() : null;
+            const mobile = item.mobile !== undefined ? String(item.mobile || '').trim() : null;
+            const areaCode = item.areaCode !== undefined ? String(item.areaCode || '').trim() : null;
+            const password = item.password !== undefined ? String(item.password || '').trim() : null;
+            const deviceId = item.deviceId !== undefined ? String(item.deviceId || '').trim() : null;
+            const lastLoginAt = item.lastLoginAt ? String(item.lastLoginAt) : null;
+            const autoLogin = item.autoLogin !== undefined ? !!item.autoLogin : null;
+
+            if (byName.has(name)) {
+                const idx = byName.get(name);
+                const t = raw[idx];
+                let dirty = false;
+                if (token && token !== t.token) {
+                    t.token = token;
+                    t.paused = false;
+                    t.lastLoginError = '';
+                    dirty = true;
+                }
+                if (email !== null && email && email !== t.email) { t.email = email; dirty = true; }
+                if (mobile !== null && mobile && mobile !== t.mobile) { t.mobile = mobile; dirty = true; }
+                if (areaCode !== null && areaCode && areaCode !== t.areaCode) { t.areaCode = areaCode; dirty = true; }
+                if (password !== null && password && password !== t.password) { t.password = password; dirty = true; }
+                if (deviceId !== null && deviceId && deviceId !== t.deviceId) { t.deviceId = deviceId; dirty = true; }
+                if (lastLoginAt && lastLoginAt !== t.lastLoginAt) { t.lastLoginAt = lastLoginAt; dirty = true; }
+                if (autoLogin !== null && autoLogin !== t.autoLogin) { t.autoLogin = autoLogin; dirty = true; }
+                // 仅显式 forceDisabled 才允许客户端改服务端禁用态
+                if (item.forceDisabled === true && !t.disabled) { t.disabled = true; dirty = true; }
+                if (item.forceDisabled === false && t.disabled) { t.disabled = false; dirty = true; }
+                if (dirty) updated++;
+            } else {
+                raw.push({
+                    name,
+                    token,
+                    email: email || '',
+                    mobile: mobile || '',
+                    areaCode: areaCode || '+86',
+                    password: password || '',
+                    autoLogin: autoLogin !== false,
+                    disabled: item.forceDisabled === true,
+                    paused: false,
+                    lastLoginError: '',
+                    lastLoginAt: lastLoginAt || '',
+                    deviceId: deviceId || '',
+                });
+                byName.set(name, raw.length - 1);
+                created++;
+            }
+        }
+
+        if (created || updated) this.writeRaw(raw);
+        this.reload();
+        this.emitChange('sync');
+        return { ok: true, created, updated, total: raw.length, status: this.statusSnapshot() };
+    }
+
+    setDisabled(index, disabled) {
+        const raw = this.readRaw();
+        if (index < 0 || index >= raw.length) return { ok: false, error: '账号不存在' };
+        raw[index].disabled = !!disabled;
+        if (disabled) raw[index].paused = true;
+        else raw[index].paused = false;
+        this.writeRaw(raw);
+        this.reload();
+        this.emitChange(disabled ? 'disable' : 'enable');
+        return { ok: true, account: { name: raw[index].name, disabled: !!disabled } };
+    }
 }
 
-module.exports = new AccountPool();
+// 状态变更事件（供 SSE 下发给本地 Studio）
+const bus = new EventEmitter();
+bus.setMaxListeners(200);
+const pool = new AccountPool();
+const origWrite = pool.writeRaw.bind(pool);
+pool.writeRaw = function (list) {
+    const r = origWrite(list);
+    if (r) this.emitChange('write');
+    return r;
+};
+pool.emitChange = function (reason) {
+    try {
+        bus.emit('change', { reason, at: Date.now(), status: pool.statusSnapshot() });
+    } catch (e) {}
+};
+pool.on = bus.on.bind(bus);
+pool.off = bus.off.bind(bus);
+pool.once = bus.once.bind(bus);
+
+module.exports = pool;
