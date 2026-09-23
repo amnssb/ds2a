@@ -1,6 +1,6 @@
 'use strict';
 /**
- * src/ds-login.js — 「账号 + 密码」自动登录 chat.deepseek.com，换回 userToken
+ * src/ds-login.js — 「账号 + 密码」无头浏览器自动登录 chat.deepseek.com，换回 userToken
  */
 const fs = require('fs');
 const path = require('path');
@@ -82,20 +82,45 @@ function buildBody(o, did) {
     return body;
 }
 
+function normalizeToken(raw) {
+    if (raw == null) return '';
+    let t = String(raw).trim();
+    if (!t) return '';
+    if (t.startsWith('{')) {
+        try {
+            const o = JSON.parse(t);
+            const v = o && (o.value ?? o.token ?? o.user_token);
+            if (v && String(v).trim() && String(v) !== 'null') return String(v).trim();
+            return '';
+        } catch (e) { return ''; }
+    }
+    if (t === 'null' || t === 'undefined') return '';
+    return t;
+}
+
 function pickToken(bd) {
     if (!bd) return '';
-    if (bd.user && bd.user.token) return String(bd.user.token);
-    if (bd.token) return String(bd.token);
-    if (bd.user_token) return String(bd.user_token);
+    if (bd.user && bd.user.token) return normalizeToken(bd.user.token);
+    if (bd.token) return normalizeToken(bd.token);
+    if (bd.user_token) return normalizeToken(bd.user_token);
     return '';
 }
 
 function friendly(bizCode, msg) {
     const m = String(msg || '');
+    if (/RISK_DEVICE_DETECTED/i.test(m)) {
+        return '设备风控拦截（RISK_DEVICE_DETECTED）：当前登录环境被 DeepSeek 判定为风险设备';
+    }
     if (/password|密码/i.test(m)) return '账号或密码错误（' + m + '）';
     if (bizCode === 40002 || bizCode === 40003) return '账号或密码错误';
     if (bizCode === 40001) return '请求参数被服务端拒绝：' + (m || 'bad request');
     return m || ('登录失败 biz_code=' + bizCode);
+}
+
+function isRiskish(out) {
+    if (!out || out.ok) return false;
+    const s = String((out.error || '') + ' ' + (out.raw || ''));
+    return /RISK_DEVICE|RISK_|device_risk|设备风控|40007|40008|40009/i.test(s);
 }
 
 function interpret(status, ctype, text, did) {
@@ -153,7 +178,16 @@ async function fetchPowHeaderHttp(targetPath, timeoutMs) {
 async function httpLogin(o) {
     const did = String(o.deviceId || deviceIdFor(seedOf(o)));
     const body = buildBody(o, did);
-    const headers = { 'accept': '*/*', 'content-type': 'application/json', 'user-agent': UA, 'origin': BASE, 'referer': BASE + '/sign_in' };
+    const headers = Object.assign({}, CLIENT_HEADERS, {
+        'user-agent': UA,
+        'sec-ch-ua': '"Chromium";v="131", "Not_A Brand";v="24"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'sec-fetch-site': 'same-origin',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-dest': 'empty',
+        'accept-language': 'en-US,en;q=0.9,zh-CN;q=0.8',
+    });
     const pow = await fetchPowHeaderHttp(LOGIN_PATH);
     if (pow) headers['x-ds-pow-response'] = pow;
 
@@ -174,8 +208,19 @@ class BrowserSession {
     constructor(opts) {
         const o = opts || {};
         this.headless = o.headless !== false;
-        this.port = Number(o.port || process.env.DS_LOGIN_PORT || 9701);
-        this.tag = String(o.tag || (this.headless ? 'login' : 'login-headful'));
+        // 每个 profile 用独立调试端口，避免多账号互踢
+        let port = Number(o.port || process.env.DS_LOGIN_PORT || 9701);
+        if (!o.port && !process.env.DS_LOGIN_PORT && o.tag) {
+            let h = 0;
+            const s = String(o.tag);
+            for (let i = 0; i < s.length; i++) h = (h * 33 + s.charCodeAt(i)) >>> 0;
+            port = 9701 + (h % 200);
+        }
+        this.port = port;
+        // 有头专用 profile：避免多账号串会话拿到上一个 userToken
+        this.tag = String(o.tag || (this.headless
+            ? 'login'
+            : ('login-headful-' + (o.profileTag || 'default'))));
         this.child = null;
         this.ws = null;
         this.sid = null;
@@ -187,7 +232,7 @@ class BrowserSession {
     async start() {
         if (!WS) throw new Error('缺少 ws 依赖（npm i ws）');
         const exe = findChrome();
-        if (!exe) throw new Error('找不到 Chrome/Edge 浏览器，自动登录需通过纯 HTTP 或配置 DS_CHROME 路径');
+        if (!exe) throw new Error('找不到 Chrome/Edge 浏览器，无头登录需安装浏览器或配置 DS_CHROME 路径');
         const profileDir = path.join(config.ROOT_DIR, '.chrome-profiles', this.tag);
         fs.mkdirSync(profileDir, { recursive: true });
         const args = [
@@ -260,7 +305,7 @@ class BrowserSession {
 
     async openSignIn() {
         await this.send('Page.navigate', { url: BASE + '/sign_in' }, this.sid);
-        await sleep(1500);
+        await sleep(this.headless === false ? 4000 : 2000);
     }
 
     async probe() {
@@ -270,13 +315,30 @@ class BrowserSession {
         try { return await this.ev(expr); } catch (e) { return 'ERR|' + e.message; }
     }
 
+    async readUserToken() {
+        try {
+            return normalizeToken(await this.ev(`(function(){try{var r=localStorage.getItem("userToken");if(!r)return"";var o=JSON.parse(r);return (o&&o.value)?String(o.value):"";}catch(e){return""}})()`));
+        } catch (e) { return ''; }
+    }
+
     async waitWaf(timeoutMs) {
         const t0 = Date.now();
-        const limit = timeoutMs || 45000;
+        const headful = this.headless === false;
+        const limit = timeoutMs || (headful ? 180000 : 45000);
         while (Date.now() - t0 < limit) {
+            // 有头：人工已登录则直接算过
+            if (headful) {
+                const tok = await this.readUserToken();
+                if (tok && tok.length > 20) return true;
+            }
             const p = await this.probe();
-            if (typeof p === 'string' && p.indexOf('200|application/json') === 0) return true;
-            await sleep(1200);
+            if (typeof p === 'string' && /^\d+\|application\/json/i.test(p)) return true;
+            if (typeof p === 'string') {
+                const status = parseInt(p, 10);
+                const ct = (p.split('|')[1] || '').toLowerCase();
+                if (status >= 200 && status < 500 && ct.includes('json')) return true;
+            }
+            await sleep(1500);
         }
         return false;
     }
@@ -284,9 +346,9 @@ class BrowserSession {
     async pagePost(urlPath, body, extraHeaders, opts) {
         const payload = JSON.stringify(body || {});
         const o = opts || {};
-        const base = o.clientHeaders
-            ? "{'content-type':'application/json','accept':'*/*','x-client-platform':'web','x-client-version':'2.5.0','x-client-locale':'en_US','x-client-bundle-id':'com.deepseek.chat'}"
-            : "{'content-type':'application/json','accept':'*/*'}";
+        const base = o.clientHeaders === false
+            ? "{'content-type':'application/json','accept':'*/*'}"
+            : "{'content-type':'application/json','accept':'*/*','x-client-platform':'web','x-client-version':'2.5.0','x-client-locale':'en_US','x-client-bundle-id':'com.deepseek.chat','origin':'https://chat.deepseek.com','referer':'https://chat.deepseek.com/sign_in'}";
         const extra = JSON.stringify(extraHeaders || {});
         const expr = "(async()=>{try{const r=await fetch(" + JSON.stringify(urlPath) +
             ",{method:'POST',headers:Object.assign(" + base + "," + extra +
@@ -298,15 +360,161 @@ class BrowserSession {
         catch (e) { return { status: 0, error: '页面返回无法解析: ' + String(raw).slice(0, 120) }; }
     }
 
+    async waitSignInForm(timeoutMs) {
+        const t0 = Date.now();
+        const limit = timeoutMs || 60000;
+        const expr = `(function(){
+          try {
+            const pwd = document.querySelector('input[type="password"]');
+            if (!pwd) return 'none';
+            const form = pwd.form || pwd.closest('form');
+            let email = document.querySelector('input[type="email"],input[name="email"],input[placeholder*="mail" i],input[autocomplete="username"]');
+            if (!email && form) email = form.querySelector('input:not([type="password"])');
+            return 'ok|' + (email ? '1' : '0');
+          } catch(e) { return 'err|' + e.message; }
+        })()`;
+        while (Date.now() - t0 < limit) {
+            try {
+                const s = await this.ev(expr);
+                if (typeof s === 'string' && s.startsWith('ok|')) return true;
+            } catch (e) {}
+            await sleep(800);
+        }
+        return false;
+    }
+
+    async fillAndSubmitLogin(o) {
+        const email = String(o.email || '').trim();
+        const mobile = String(o.mobile || '').trim();
+        const password = String(o.password || '');
+        const account = email || mobile;
+        if (!account || !password) return false;
+
+        const expr = `(function(){
+          try {
+            const pwd = document.querySelector('input[type="password"]');
+            if (!pwd) return 'no-pwd';
+            const form = pwd.form || pwd.closest('form');
+            let emailEl = document.querySelector('input[type="email"],input[name="email"],input[placeholder*="mail" i],input[autocomplete="username"]');
+            if (!emailEl && form) {
+              const inputs = [...(form.querySelectorAll('input')||[])].filter(i => i !== pwd && i.type !== 'hidden' && i.type !== 'submit');
+              emailEl = inputs[0] || null;
+            }
+            if (!emailEl && ' + JSON.stringify(!!mobile) + ') {
+              emailEl = document.querySelector('input[name="mobile"],input[type="tel"],input[placeholder*="手机" i]');
+            }
+            const acc = ${JSON.stringify(account)};
+            const pass = ${JSON.stringify(password)};
+            if (emailEl) {
+              const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+              setter.call(emailEl, acc);
+              emailEl.dispatchEvent(new Event('input', { bubbles: true }));
+              emailEl.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            const setterP = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            setterP.call(pwd, pass);
+            pwd.dispatchEvent(new Event('input', { bubbles: true }));
+            pwd.dispatchEvent(new Event('change', { bubbles: true }));
+            let btn = (form && (form.querySelector('button[type="submit"],button'))) ||
+                      document.querySelector('button[type="submit"]');
+            if (!btn) {
+              btn = [...document.querySelectorAll('button,div[role="button"],span')].find(function(el){
+                const t = (el.textContent||'').trim();
+                return /登录|登陆|sign in|log in/i.test(t) && el.offsetParent !== null;
+              });
+            }
+            if (!btn) return 'no-btn';
+            btn.click();
+            return 'clicked';
+          } catch(e) { return 'err|' + e.message; }
+        })()`;
+        try {
+            const r = await this.ev(expr);
+            console.log('[ds-login] 表单登录:', r);
+            return r === 'clicked';
+        } catch (e) {
+            console.log('[ds-login] 表单登录异常:', e.message);
+            return false;
+        }
+    }
+
     async login(o) {
-        const did = String(o.deviceId || deviceIdFor(seedOf(o)));
+        let did = String(o.deviceId || deviceIdFor(seedOf(o)));
         const body = buildBody(o, did);
 
         await this.openSignIn();
-        const wafOk = await this.waitWaf(o.wafTimeoutMs || Number(process.env.DS_WAF_TIMEOUT_S || 45) * 1000);
+        const headful = this.headless === false;
+        const wafTimeout = o.wafTimeoutMs || Number(process.env.DS_WAF_TIMEOUT_S || (headful ? 180 : 45)) * 1000;
+
+        if (headful) {
+            const t0 = Date.now();
+            let lastLog = 0;
+            let submitted = false;
+            let submitAt = 0;
+            console.log('[ds-login] 有头：等待登录页/人工登录，超时 ' + Math.round(wafTimeout / 1000) + 's');
+            while (Date.now() - t0 < wafTimeout) {
+                const tok = await this.readUserToken();
+                if (tok && tok.length > 20) {
+                    return { ok: true, token: tok, deviceId: did, from: 'manual-headful' };
+                }
+
+                if (!submitted) {
+                    const formOk = await this.waitSignInForm(4000);
+                    if (formOk) {
+                        const clicked = await this.fillAndSubmitLogin(o);
+                        if (clicked) {
+                            submitted = true;
+                            submitAt = Date.now();
+                            console.log('[ds-login] 已提交表单，等待出 token / 验证码…');
+                        }
+                    }
+                } else if (Date.now() - submitAt > 8000) {
+                    // 提交后 8s 仍无 token：可能要点验证码，再补一次提交
+                    const tok2 = await this.readUserToken();
+                    if (tok2 && tok2.length > 20) {
+                        return { ok: true, token: tok2, deviceId: did, from: 'form-headful' };
+                    }
+                    await this.fillAndSubmitLogin(o);
+                    submitAt = Date.now();
+                }
+
+                const elapsed = Date.now() - t0;
+                if (elapsed - lastLog >= 5000) {
+                    lastLog = elapsed;
+                    console.log('[ds-login] 有头登录中… ' + Math.round(elapsed / 1000) + 's / ' + Math.round(wafTimeout / 1000) + 's' + (submitted ? ' (已提交表单)' : ' (等表单)'));
+                }
+                await sleep(1000);
+            }
+            const tokEnd = await this.readUserToken();
+            if (tokEnd && tokEnd.length > 20) {
+                return { ok: true, token: tokEnd, deviceId: did, from: 'manual-headful' };
+            }
+            // 有头超时：仍带上下文返回，便于上层提示人工登录
+            return { ok: false, waf: true, deviceId: did, error: '有头登录超时：未拿到 userToken（请在窗口完成验证码/手动登录后重试）' };
+        }
+
+        const wafOk = await this.waitWaf(wafTimeout);
         if (!wafOk) {
             return { ok: false, waf: true, deviceId: did, error: 'AWS WAF 挑战未通过（IP 可能被风控拦截）' };
         }
+
+        try {
+            const pageDid = await this.ev(`(function(){
+              try {
+                const ls = window.localStorage || {};
+                const keys = ['device_id','deviceId','ds_device_id','__ds_device_id','deviceid'];
+                for (const k of keys) {
+                  const v = ls.getItem && ls.getItem(k);
+                  if (v && String(v).length >= 8) return String(v);
+                }
+                const m = document.cookie.match(/(?:^|;\\s*)(device_id|deviceId|ds_device_id)=([^;]+)/i);
+                if (m && m[2]) return decodeURIComponent(m[2]);
+              } catch(e) {}
+              return '';
+            })()`);
+            if (pageDid && String(pageDid).trim()) did = String(pageDid).trim();
+        } catch (e) {}
+        body.device_id = did;
 
         let pow = null;
         try {
@@ -329,9 +537,42 @@ class BrowserSession {
             lr = await this.pagePost(LOGIN_PATH, body, pow ? { 'x-ds-pow-response': pow } : {});
             if (lr.status === 0) return { ok: false, deviceId: did, error: '页面内请求失败: ' + lr.error };
             out = interpret(lr.status, lr.ctype, lr.text, did);
-            if (!out.waf) return out;
+            if (!out.waf) {
+                if (out.ok && out.token) {
+                    const nt = normalizeToken(out.token);
+                    if (nt && nt.length > 20) out.token = nt;
+                    try {
+                        const lsTok = await this.readUserToken();
+                        if (lsTok && lsTok.length > 20) out.token = lsTok;
+                    } catch (e) {}
+                    if (!normalizeToken(out.token)) {
+                        for (let k = 0; k < 10; k++) {
+                            await sleep(800);
+                            const lsTok = await this.readUserToken();
+                            if (lsTok && lsTok.length > 20) {
+                                out.token = lsTok;
+                                break;
+                            }
+                        }
+                    }
+                    const finalTok = normalizeToken(out.token);
+                    if (finalTok) {
+                        out.token = finalTok;
+                        return out;
+                    }
+                    out.ok = false;
+                    out.error = '登录响应未拿到有效 userToken（可能是壳数据）';
+                }
+                if (!out.ok) {
+                    const manual = await this.readUserToken();
+                    if (manual && manual.length > 20) {
+                        return { ok: true, token: manual, deviceId: did, from: 'manual-after-login' };
+                    }
+                }
+                return out;
+            }
             pow = null;
-            await sleep(1200 + i * 400);
+            await sleep(2000 + i * 800);
             try { await this.probe(); } catch (e) {}
         }
         return out;
@@ -350,13 +591,13 @@ const STARTING = new Map();
 let IDLE_TIMER = null;
 const IDLE_MS = Number(process.env.DS_LOGIN_IDLE_S || 120) * 1000;
 
-async function sharedSession(headless) {
-    const key = headless ? 'h' : 'f';
+async function sharedSession(headless, profileTag) {
+    const key = (headless ? 'h' : 'f') + ':' + (profileTag || 'default');
     const cur = SESSIONS.get(key);
     if (cur && cur.alive) return cur;
     if (STARTING.has(key)) return STARTING.get(key);
     const p = (async () => {
-        const s = new BrowserSession({ headless });
+        const s = new BrowserSession({ headless, tag: headless ? 'login' : ('login-headful-' + (profileTag || 'default')) });
         await s.start();
         SESSIONS.set(key, s);
         return s;
@@ -371,8 +612,8 @@ function touchShared() {
     if (IDLE_TIMER.unref) IDLE_TIMER.unref();
 }
 
-async function dropShared(headless) {
-    const key = headless ? 'h' : 'f';
+async function dropShared(headless, profileTag) {
+    const key = (headless ? 'h' : 'f') + ':' + (profileTag || 'default');
     const s = SESSIONS.get(key);
     SESSIONS.delete(key);
     if (s) await s.close().catch(() => {});
@@ -386,6 +627,45 @@ async function closeSharedBrowser() {
     return all.length;
 }
 
+function httpAllowed() {
+    const v = String(process.env.DS_LOGIN_HTTP || '').toLowerCase();
+    return v === '1' || v === 'true' || v === 'yes';
+}
+
+async function loginViaBrowsers(o) {
+    if (!WS) {
+        return { ok: false, error: '无头登录失败：缺少 ws 依赖（npm i ws），且未找到可用浏览器' };
+    }
+
+    // 默认纯无头；DS_LOGIN_HEADFUL=1 时优先有头（便于人工看/点）
+    const headful = process.env.DS_LOGIN_HEADFUL === '1' || process.env.DS_LOGIN_HEADFUL === 'true';
+    const order = headful ? [false, true] : [true];
+    const profileTag = o.profileTag || o.name || seedOf(o) || 'default';
+    let last = null;
+
+    for (const hl of order) {
+        let sess;
+        try {
+            sess = await sharedSession(hl, profileTag);
+        } catch (e) {
+            last = { ok: false, error: (hl ? '无头' : '有头') + '浏览器启动失败: ' + e.message };
+            continue;
+        }
+
+        try {
+            const r = await sess.login(o);
+            touchShared();
+            if (r.ok) return r;
+            last = r;
+            if (r.waf || isRiskish(r)) await dropShared(hl, profileTag);
+        } catch (e) {
+            last = { ok: false, error: '浏览器登录异常: ' + e.message };
+            await dropShared(hl, profileTag).catch(() => {});
+        }
+    }
+    return last || { ok: false, error: '无头登录未产生结果' };
+}
+
 async function login(opts) {
     const o = opts || {};
     const email = String(o.email || '').trim();
@@ -393,32 +673,18 @@ async function login(opts) {
     if (!email && !mobile) return { ok: false, error: '缺少邮箱或手机号' };
     if (!o.password && !o.code) return { ok: false, error: '缺少密码' };
 
-    const fast = await httpLogin(o);
-    if (fast.ok || !fast.waf) return fast;
-
-    if (!WS) return Object.assign({}, fast, { error: fast.error + '（且缺少 ws 依赖，无法走浏览器路径）' });
-
-    const headful = process.env.DS_LOGIN_HEADFUL === '1' || process.env.DS_LOGIN_HEADFUL === 'true';
-    const order = headful ? [false] : [true, false];
-    let last = fast;
-
-    for (const hl of order) {
-        let sess;
-        try { sess = await sharedSession(hl); }
-        catch (e) { last = { ok: false, error: '启动浏览器失败: ' + e.message }; continue; }
-
-        try {
-            const r = await sess.login(o);
-            touchShared();
-            if (r.ok || !r.waf) return r;
-            last = r;
-            await dropShared(hl);
-        } catch (e) {
-            last = { ok: false, error: '浏览器登录异常: ' + e.message };
-            await dropShared(hl).catch(() => {});
-        }
+    // 默认：始终无头浏览器登录（不先打裸 HTTP）
+    // 仅当 DS_LOGIN_HTTP=1 时，才先试 HTTP，失败后再无头兜底
+    if (httpAllowed()) {
+        const fast = await httpLogin(o);
+        if (fast.ok) return fast;
+        if (!fast.waf && !isRiskish(fast)) return fast;
+        const br = await loginViaBrowsers(o);
+        if (br && br.ok) return br;
+        return br || fast;
     }
-    return last;
+
+    return loginViaBrowsers(o);
 }
 
 module.exports = {

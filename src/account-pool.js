@@ -76,7 +76,7 @@ class AccountPool {
                     rootHasNew = true;
                 }
                 // 同步其余配置字段（password/email 等），避免双文件脱节
-                for (const f of ['email', 'mobile', 'areaCode', 'password', 'autoLogin', 'disabled', 'name']) {
+                for (const f of ['email', 'mobile', 'areaCode', 'password', 'autoLogin', 'disabled', 'name', 'deviceId']) {
                     if (item[f] !== undefined && item[f] !== null && item[f] !== '' && item[f] !== existing[f]) {
                         existing[f] = item[f];
                         rootHasNew = true;
@@ -142,6 +142,7 @@ class AccountPool {
                 name,
                 token: item.token || '',
                 email: item.email || '',
+                deviceId: item.deviceId || '',
                 mobile: item.mobile || '',
                 areaCode: item.areaCode || '+86',
                 password: item.password || '',
@@ -336,18 +337,23 @@ class AccountPool {
         logger.info(`正在为账号 ${account.name} 尝试自动重新登录刷新 Token...`);
         try {
             const dsLogin = require('../ds-login');
-            const r = await dsLogin.loginAccount(account);
+            const opts = { ...account };
+            if (account.deviceId) opts.deviceId = account.deviceId;
+            const r = await dsLogin.loginAccount(opts);
             if (r.ok && r.token) {
                 logger.ok(`🎉 账号 ${account.name} 自动重新登录成功，新 Token 已更新，恢复调度！`);
-                this.updateAccount(account.index, {
+                const patch = {
                     token: r.token,
                     paused: false,
                     lastLoginAt: new Date().toISOString(),
                     lastLoginError: '',
-                });
+                };
+                if (r.deviceId) patch.deviceId = r.deviceId;
+                this.updateAccount(account.index, patch);
                 return true;
             } else {
                 logger.err(`账号 ${account.name} 自动重登未成功: ${r.error || '未知原因'}`);
+                if (r.deviceId) this.updateAccount(account.index, { deviceId: r.deviceId });
                 return false;
             }
         } catch (e) {
@@ -368,8 +374,13 @@ class AccountPool {
         const raw = this.readRaw();
         let token = String(accData.token || '').trim();
         if (token.startsWith('{')) {
-            try { token = JSON.parse(token).value || token; } catch (e) {}
+            try {
+                const o = JSON.parse(token);
+                const v = o && (o.value ?? o.token ?? o.user_token);
+                token = (v && String(v).trim() && String(v) !== 'null') ? String(v).trim() : '';
+            } catch (e) { token = ''; }
         }
+        if (token === 'null' || token === 'undefined') token = '';
         const name = String(accData.name || ('acc' + (raw.length + 1))).trim();
 
         const item = {
@@ -400,13 +411,20 @@ class AccountPool {
         if (patch.token !== undefined) {
             let token = String(patch.token).trim();
             if (token.startsWith('{')) {
-                try { token = JSON.parse(token).value || token; } catch (e) {}
+                try {
+                    const o = JSON.parse(token);
+                    const v = o && (o.value ?? o.token ?? o.user_token);
+                    token = (v && String(v).trim() && String(v) !== 'null') ? String(v).trim() : '';
+                } catch (e) { token = ''; }
             }
+            if (token === 'null' || token === 'undefined') token = '';
             if (token && token !== target.token) {
                 target.token = token;
                 // 更新 Token 时自动解除暂停并清除错误
                 target.paused = false;
                 target.lastLoginError = '';
+            } else if (!token && patch.token === '') {
+                target.token = '';
             }
         }
         if (patch.name) target.name = String(patch.name).trim();
@@ -414,6 +432,7 @@ class AccountPool {
         if (patch.mobile !== undefined) target.mobile = String(patch.mobile).trim();
         if (patch.areaCode !== undefined) target.areaCode = String(patch.areaCode).trim();
         if (patch.password !== undefined) target.password = String(patch.password).trim();
+        if (patch.deviceId !== undefined) target.deviceId = String(patch.deviceId).trim();
         if (patch.autoLogin !== undefined) target.autoLogin = !!patch.autoLogin;
         if (patch.disabled !== undefined) target.disabled = !!patch.disabled;
         if (patch.paused !== undefined) target.paused = !!patch.paused;

@@ -141,19 +141,26 @@ router.post('/api/accounts/:index/login', async (req, res) => {
 
     try {
         const dsLogin = require('../ds-login');
-        const r = await dsLogin.loginAccount(acc);
+        const loginOpts = { ...acc };
+        if (acc.deviceId) loginOpts.deviceId = acc.deviceId;
+        const r = await dsLogin.loginAccount(loginOpts);
         if (r.ok && r.token) {
-            accountPool.updateAccount(idx, {
+            const patch = {
                 token: r.token,
                 paused: false,
                 lastLoginAt: new Date().toISOString(),
                 lastLoginError: '',
-            });
+            };
+            if (r.deviceId) patch.deviceId = r.deviceId;
+            accountPool.updateAccount(idx, patch);
             accountPool.resumeAccount(idx);
-            res.json({ ok: true, token: r.token });
+            res.json({ ok: true, token: r.token, deviceId: r.deviceId || '' });
         } else {
-            accountPool.updateAccount(idx, { lastLoginError: r.error || '登录失败' });
-            res.status(400).json({ ok: false, error: r.error || '登录失败' });
+            const err = r.error || '登录失败';
+            const patch = { lastLoginError: err };
+            if (r.deviceId) patch.deviceId = r.deviceId;
+            accountPool.updateAccount(idx, patch);
+            res.status(400).json({ ok: false, error: err, deviceId: r.deviceId || '' });
         }
     } catch (e) {
         res.status(500).json({ ok: false, error: e.message });
