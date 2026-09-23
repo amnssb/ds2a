@@ -5,6 +5,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # docker.io 不可达时可在 .env 设 NODE_IMAGE=ds-node-base:20（由旧镜像导出）
+        NODE_IMAGE: ${NODE_IMAGE:-node:20-alpine}
     image: ds-gateway:latest
     container_name: ds-gateway
     restart: unless-stopped

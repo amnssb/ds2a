@@ -1,8 +1,13 @@
 # ==========================================
 # 阶段 1: 依赖安装与构建
 # ==========================================
-FROM node:20-alpine AS deps
+# 服务器拉不到 docker.io 时可用本地基础镜像: --build-arg NODE_IMAGE=ds-node-base:20
+ARG NODE_IMAGE=node:20-alpine
+FROM ${NODE_IMAGE} AS deps
 WORKDIR /app
+
+# 国内/受限网络：apk 源切到清华镜像
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apk/repositories || true
 
 COPY package*.json ./
 RUN npm install --omit=dev --no-audit --ignore-scripts
@@ -10,10 +15,11 @@ RUN npm install --omit=dev --no-audit --ignore-scripts
 # ==========================================
 # 阶段 2: 生产运行镜像
 # ==========================================
-FROM node:20-alpine AS runner
+FROM ${NODE_IMAGE} AS runner
 WORKDIR /app
 
 # 安装 tini 实现精确的进程生命周期与信号传递（保障容器停机时数据落盘）
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apk/repositories || true
 RUN apk add --no-cache tini tzdata curl \
     && cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
     && echo "Asia/Shanghai" > /etc/timezone
