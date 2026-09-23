@@ -1,9 +1,10 @@
 'use strict';
 /**
  * src/routes/chat.js — OpenAI / Claude 兼容对话接口
- * - 自动从 AccountPool 获取健康账号，遇 40003/401 立即熔断并故障转移到下一账号
- * - 每次调用（无论成功或失败）均持久化至 storage，保证重启后数据不丢失
- * - 完整支持 SSE 流式、思考链 (thinking)、工具调用 (tools)、图片/文档内联
+ * - 自动从 AccountPool 获取健康账号，遇失效自动 Failover 故障转移
+ * - 完整持久化至 storage，保证重启后数据不丢失
+ * - 完整支持 SSE 流式、思考链 (thinking)、工具调用 (tools)、文件引用 (file_ids)
+ * - 导出 sessions 供会话管理路由使用
  */
 const express = require('express');
 const crypto = require('crypto');
@@ -13,6 +14,7 @@ const storage = require('../storage');
 const accountPool = require('../account-pool');
 const ds = require('../ds-client');
 const auth = require('../auth');
+const upload = require('../upload');
 
 const router = express.Router();
 
@@ -28,7 +30,7 @@ setInterval(async () => {
             await ds.deleteSession(v.token, v.sid).catch(() => {});
         }
     }
-}, 30000);
+}, 15000);
 
 function resolveSessionKey(req, body) {
     const h = req.headers['x-session-id'] || req.headers['x-conversation-id'];
@@ -137,7 +139,7 @@ function resolveThinking(body) {
     const eff = body.reasoning_effort;
     if (typeof eff === 'string') return !(eff === 'none' || eff === 'off');
     const m = String(body.model || '').toLowerCase();
-    if (/-think(ing)?$/.test(m) || /reasoner|deepseek-r1$/.test(m)) return true;
+    if (/-think(ing)?$/.test(m) || /reasoner|deepseek-r1|r1/.test(m)) return true;
     return false;
 }
 
@@ -259,27 +261,39 @@ function resolveApiKey(req) {
     return { keyId: null, name: '(匿名)' };
 }
 
-// ---------- 核心执行逻辑（含多账号 Failover 故障转移） ----------
+// ---------- 核心执行逻辑（多账号 Failover 故障转移） ----------
 async function executeWithFailover(opts) {
     const { body, sessionKey, ephemeral, signal, onThinking, onDelta } = opts;
     const thinking = resolveThinking(body);
     const search = resolveSearch(body);
     const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
     const inlineFiles = extractInlineFiles(body.messages || []);
-    const fileIds = Array.isArray(body.file_ids) ? [...body.file_ids] : [];
+
+    // 检查是否有上传文件引用
+    const wantedFiles = [].concat(body.file_ids || [], body.files || []).filter(x => typeof x === 'string');
+    for (const fid of wantedFiles) {
+        const f = upload.uploadBuffers.get(fid);
+        if (f) {
+            inlineFiles.push({ name: f.name, mime: f.mime, data: Buffer.from(f.data, 'base64') });
+        }
+    }
 
     const excludedAccounts = [];
     let lastError = null;
 
-    // 最多尝试池中的可用账号数（至多 5 次）
     const maxTries = Math.min(Math.max(1, accountPool.accounts.length), 5);
 
     for (let attempt = 0; attempt < maxTries; attempt++) {
+        // 若所有账号都已在前面尝试过，无需再次进入 acquire
+        if (excludedAccounts.length >= accountPool.accounts.length && lastError) {
+            break;
+        }
+
         let account = null;
         try {
             account = accountPool.acquire(excludedAccounts);
         } catch (e) {
-            throw new Error(lastError ? `${lastError.message}（且${e.message}）` : e.message);
+            throw lastError ? lastError : e;
         }
 
         try {
@@ -303,11 +317,13 @@ async function executeWithFailover(opts) {
             sess.lastUsed = Date.now();
 
             // 2. 附件上传
+            const uploadedFileIds = [];
             if (inlineFiles.length) {
                 for (const f of inlineFiles) {
                     const fid = await ds.uploadFile(account.token, f.name, f.data, f.mime, 'default');
                     await ds.waitFileReady(account.token, fid, 60000);
-                    fileIds.push(fid);
+                    uploadedFileIds.push(fid);
+                    logger.info(`附件已成功挂载至 DeepSeek: ${f.name} → ${fid.slice(0, 16)}`);
                 }
             }
 
@@ -323,7 +339,7 @@ async function executeWithFailover(opts) {
                 parentMessageId: sess.parent,
                 thinkingEnabled: thinking,
                 searchEnabled: search,
-                refFileIds: fileIds,
+                refFileIds: uploadedFileIds,
                 onEvent: (ty, d) => {
                     if (ty === 'thinking') onThinking(d);
                     else if (ty === 'content') onDelta(d);
@@ -428,14 +444,14 @@ router.post('/v1/chat/completions', async (req, res) => {
         filter.flush();
 
         const rawContent = r.content || content;
-        const parsed = (r.hasTools || hasTools) ? parseToolCalls(rawContent) : { content, toolCalls: [] };
+        const parsed = (r.hasTools || hasTools) ? parseToolCalls(rawContent) : { content: rawContent, toolCalls: [] };
         const finish = parsed.toolCalls.length ? 'tool_calls' : 'stop';
 
         const pTokens = r.tokens ? Math.round(r.tokens * 0.6) : estimateTokens(r.prompt);
-        const cTokens = r.tokens ? Math.round(r.tokens * 0.4) : estimateTokens(content);
-        const tTokens = estimateTokens(thinking);
+        const cTokens = r.tokens ? Math.round(r.tokens * 0.4) : estimateTokens(rawContent);
+        const tTokens = estimateTokens(r.thinking || thinking);
 
-        // 无论成功还是失败，永久落盘至 storage
+        // 记录用量与请求日志
         storage.record({
             id,
             at: t0,
@@ -457,7 +473,6 @@ router.post('/v1/chat/completions', async (req, res) => {
             thinkingTokens: tTokens,
         });
 
-        // 记入 auth 用量
         auth.recordUsage({
             keyId: keyInfo.keyId,
             account: r.accountName,
@@ -477,7 +492,7 @@ router.post('/v1/chat/completions', async (req, res) => {
             res.end();
         } else {
             const msg = { role: 'assistant', content: parsed.toolCalls.length ? (parsed.content || null) : parsed.content };
-            if (thinking) msg.reasoning_content = thinking;
+            if (r.thinking || thinking) msg.reasoning_content = r.thinking || thinking;
             if (parsed.toolCalls.length) msg.tool_calls = parsed.toolCalls;
 
             res.json({
@@ -494,7 +509,7 @@ router.post('/v1/chat/completions', async (req, res) => {
             });
         }
 
-        logger.ok(`完成请求 ${Date.now() - t0}ms | 正文:${content.length}字 思考:${thinking.length}字 | 账号: ${r.accountName}`);
+        logger.ok(`完成请求 ${Date.now() - t0}ms | 正文:${rawContent.length}字 思考:${(r.thinking || thinking).length}字 | 账号: ${r.accountName}`);
     } catch (e) {
         logger.err('chat/completions 失败: ' + e.message);
 
@@ -547,20 +562,26 @@ router.post('/v1/messages', async (req, res) => {
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
         if (res.flushHeaders) res.flushHeaders();
+        res.write('event: message_start\ndata: ' + JSON.stringify({ type: 'message_start', message: { id, type: 'message', role: 'assistant', model: body.model || 'deepseek-v4.1-flash', content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } } }) + '\n\n');
     }
 
     let content = '', thinking = '';
     const ac = new AbortController();
     req.on('close', () => ac.abort());
 
-    try {
+    const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
+    const filter = createToolCallFilter(hasTools, (d) => {
+        content += d;
         if (stream) {
-            res.write('event: message_start\ndata: ' + JSON.stringify({
-                type: 'message_start',
-                message: { id, type: 'message', role: 'assistant', model: body.model || 'claude-3-5-sonnet', content: [], usage: { input_tokens: 0, output_tokens: 0 } }
-            }) + '\n\n');
+            res.write('event: content_block_delta\ndata: ' + JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: d } }) + '\n\n');
         }
+    });
 
+    if (stream) {
+        res.write('event: content_block_start\ndata: ' + JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }) + '\n\n');
+    }
+
+    try {
         const r = await executeWithFailover({
             body,
             sessionKey: sess.key,
@@ -568,34 +589,34 @@ router.post('/v1/messages', async (req, res) => {
             signal: ac.signal,
             onThinking: d => {
                 thinking += d;
-                if (stream) res.write('event: content_block_delta\ndata: ' + JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: d } }) + '\n\n');
+                if (stream) {
+                    res.write('event: content_block_delta\ndata: ' + JSON.stringify({ type: 'content_block_delta', index: 1, delta: { type: 'thinking_delta', thinking: d } }) + '\n\n');
+                }
             },
-            onDelta: d => {
-                content += d;
-                if (stream) res.write('event: content_block_delta\ndata: ' + JSON.stringify({ type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: d } }) + '\n\n');
-            },
+            onDelta: d => filter.push(d),
         });
+        filter.flush();
+
+        const rawContent = r.content || content;
+        const parsed = (r.hasTools || hasTools) ? parseToolCalls(rawContent) : { content: rawContent, toolCalls: [] };
+        const finish = parsed.toolCalls.length ? 'tool_use' : 'end_turn';
 
         const pTokens = r.tokens ? Math.round(r.tokens * 0.6) : estimateTokens(r.prompt);
-        const cTokens = r.tokens ? Math.round(r.tokens * 0.4) : estimateTokens(content);
-        const tTokens = estimateTokens(thinking);
+        const cTokens = r.tokens ? Math.round(r.tokens * 0.4) : estimateTokens(rawContent);
 
         storage.record({
             id,
             at: t0,
             endpoint: '/v1/messages',
-            model: body.model || 'claude-3-5-sonnet',
+            model: body.model || 'deepseek-v4.1-flash',
             ok: true,
             status: 200,
             ms: Date.now() - t0,
             stream,
             account: r.accountName,
             keyName: keyInfo.name,
-            session: sess.ephemeral ? '(一次性)' : sess.key,
-            ephemeral: sess.ephemeral,
             promptTokens: pTokens,
             completionTokens: cTokens,
-            thinkingTokens: tTokens,
         });
 
         auth.recordUsage({
@@ -604,57 +625,71 @@ router.post('/v1/messages', async (req, res) => {
             ok: true,
             promptTokens: pTokens,
             completionTokens: cTokens,
-            thinkingTokens: tTokens,
         });
 
         if (stream) {
-            res.write('event: message_delta\ndata: ' + JSON.stringify({
-                type: 'message_delta',
-                delta: { stop_reason: 'end_turn' },
-                usage: { output_tokens: cTokens }
-            }) + '\n\n');
+            res.write('event: content_block_stop\ndata: ' + JSON.stringify({ type: 'content_block_stop', index: 0 }) + '\n\n');
+            res.write('event: message_delta\ndata: ' + JSON.stringify({ type: 'message_delta', delta: { stop_reason: finish }, usage: { output_tokens: cTokens } }) + '\n\n');
             res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
             res.end();
         } else {
-            const contentBlocks = [];
-            if (thinking) contentBlocks.push({ type: 'thinking', thinking });
-            contentBlocks.push({ type: 'text', text: content });
+            const blocks = [];
+            if (rawContent) blocks.push({ type: 'text', text: rawContent });
+            if (r.thinking || thinking) blocks.push({ type: 'thinking', thinking: r.thinking || thinking });
+            for (const tc of parsed.toolCalls) {
+                blocks.push({
+                    type: 'tool_use',
+                    id: tc.id,
+                    name: tc.function.name,
+                    input: JSON.parse(tc.function.arguments || '{}'),
+                });
+            }
 
             res.json({
                 id,
                 type: 'message',
                 role: 'assistant',
-                model: body.model || 'claude-3-5-sonnet',
-                content: contentBlocks,
-                stop_reason: 'end_turn',
+                model: body.model || 'deepseek-v4.1-flash',
+                content: blocks,
+                stop_reason: finish,
                 usage: { input_tokens: pTokens, output_tokens: cTokens },
             });
         }
     } catch (e) {
         logger.err('v1/messages 失败: ' + e.message);
-
-        storage.record({
-            id,
-            at: t0,
-            endpoint: '/v1/messages',
-            model: body.model || 'claude-3-5-sonnet',
-            ok: false,
-            status: 500,
-            ms: Date.now() - t0,
-            stream,
-            error: e.message,
-            keyName: keyInfo.name,
-        });
-
         if (!res.headersSent) {
             res.status(500).json({ type: 'error', error: { type: 'api_error', message: e.message } });
         } else {
             try {
-                res.write('event: error\ndata: ' + JSON.stringify({ error: { message: e.message } }) + '\n\n');
+                res.write('event: error\ndata: ' + JSON.stringify({ type: 'error', error: { type: 'api_error', message: e.message } }) + '\n\n');
                 res.end();
             } catch (e2) {}
         }
     }
 });
 
-module.exports = router;
+// ===== 辅助端点 =====
+router.post('/v1/messages/count_tokens', (req, res) => {
+    const { messages, system } = req.body || {};
+    let n = 0;
+    if (Array.isArray(messages)) for (const m of messages) n += estimateTokens(contentToText(m.content));
+    if (system) n += estimateTokens(contentToText(system));
+    res.json({ input_tokens: n });
+});
+
+router.get('/v1/models', (req, res) => {
+    res.json({
+        object: 'list',
+        data: [
+            { id: 'deepseek-chat', object: 'model', owned_by: 'deepseek' },
+            { id: 'deepseek-reasoner', object: 'model', owned_by: 'deepseek' },
+            { id: 'deepseek-v4.1-flash', object: 'model', owned_by: 'deepseek' },
+            { id: 'deepseek-v4.1-flash-thinking', object: 'model', owned_by: 'deepseek' },
+        ],
+    });
+});
+
+module.exports = {
+    router,
+    sessions,
+};

@@ -1,12 +1,13 @@
 'use strict';
 /**
- * server.js — DeepSeek 高性能网关服务入口
- * 架构重构升级：
- *  - 模块化组织 (src/config, src/storage, src/account-pool, src/pow-engine, src/routes)
- *  - 异常自动熔断与暂停调度 (遇 40003 invalid token 立刻暂停，多账号无感 Failover)
- *  - WASM 硬件加速 (耗时从 3500ms 降至 85ms，提速 40x，多并发流畅运行)
- *  - 数据永久持久化 (日志与 Token 记录实时落盘，服务重启数据不丢失)
- *  - 严格安全规范 (禁止落盘 C 盘，统一托管至 D 盘项目空间)
+ * server.js — DeepSeek 高性能企业级网关服务入口
+ * 架构特点：
+ *  - 模块化规范清晰 (src/config, src/storage, src/account-pool, src/pow-engine, src/routes)
+ *  - 完整兼容 OpenAI (/v1/chat/completions) 与 Claude (/v1/messages)
+ *  - 文件上传 (/v1/files) 与多轮会话管理 (/v1/sessions) 完整支持
+ *  - WASM 硬件级加速 + 预热 PoW 缓存池
+ *  - 智能熔断自愈与无感故障转移 (Failover)
+ *  - 严格安全规范：数据持久化统一保存在非 C 盘 (D 盘空间)
  */
 const express = require('express');
 const path = require('path');
@@ -20,7 +21,9 @@ const accountPool = require('./src/account-pool');
 const powEngine = require('./src/pow-engine');
 const auth = require('./src/auth');
 
-const chatRouter = require('./src/routes/chat');
+const { router: chatRouter } = require('./src/routes/chat');
+const filesRouter = require('./src/routes/files');
+const sessionsRouter = require('./src/routes/sessions');
 const accountsRouter = require('./src/routes/accounts');
 const statsRouter = require('./src/routes/stats');
 const { router: keysRouter, requireAdmin } = require('./src/routes/keys');
@@ -39,6 +42,7 @@ app.use((req, res, next) => {
     next();
 });
 
+// JSON 解析中间件
 app.use(express.json({ limit: `${config.MAX_UPLOAD_MB + 5}mb` }));
 
 // Cookie 解析中间件
@@ -65,48 +69,38 @@ app.use((req, res, next) => {
 app.use('/panel', express.static(config.PANEL_DIR));
 app.get('/', (req, res) => res.redirect('/panel/'));
 
-// 3. 文件上传缓冲区
-const uploadBuffers = new Map();
-const UPLOAD_TTL_MS = 30 * 60 * 1000; // 30 分钟未取用则自动回收
-
-// 定期清理过期上传缓冲（防内存泄漏）
-const _uploadGC = setInterval(() => {
-    const now = Date.now();
-    for (const [id, f] of uploadBuffers) {
-        if (now - f.at > UPLOAD_TTL_MS) uploadBuffers.delete(id);
-    }
-}, 5 * 60 * 1000);
-if (_uploadGC.unref) _uploadGC.unref();
-
-app.post('/v1/files', (req, res) => {
-    const b = req.body || {};
-    if (b && b.data) {
-        const buf = Buffer.from(String(b.data).replace(/^data:[^;]+;base64,/, ''), 'base64');
-        const fid = 'f_' + crypto.randomBytes(8).toString('hex');
-        uploadBuffers.set(fid, {
-            id: fid,
-            name: b.name || 'upload.bin',
-            mime: b.mime || 'application/octet-stream',
-            data: buf.toString('base64'),
-            size: buf.length,
-            at: Date.now(),
-        });
-        return res.json({ ok: true, file: { id: fid, name: b.name || 'upload.bin', size: buf.length } });
-    }
-    res.status(400).json({ error: '请以 JSON 格式提供 {name, mime, data(base64)}' });
-});
-app.get('/v1/files', (req, res) => res.json({ files: [...uploadBuffers.values()].map(f => ({ id: f.id, name: f.name, size: f.size, at: f.at })) }));
-app.delete('/v1/files/:id', (req, res) => res.json({ ok: uploadBuffers.delete(req.params.id) }));
-
-// 4. 路由注册
+// 3. 核心路由挂载
+app.use(filesRouter);
 app.use(chatRouter);
+app.use(sessionsRouter);
 app.use(keysRouter);
 app.use(statsRouter);
 app.use(accountsRouter);
 
-// 5. 全局错误捕获
+// 4. 健康检查端点
+app.get('/health', (req, res) => {
+    const snapshot = accountPool.snapshot();
+    const healthyCount = accountPool.getHealthyCount();
+    const { sessions } = require('./src/routes/chat');
+
+    res.json({
+        status: healthyCount > 0 ? 'ok' : 'degraded',
+        healthyAccounts: healthyCount,
+        totalAccounts: snapshot.length,
+        wasmAcceleration: powEngine.isWasmReady(),
+        sessionsCount: sessions ? sessions.size : 0,
+        accounts: snapshot,
+    });
+});
+
+// 5. 404 与全局错误处理
+app.use((req, res, next) => {
+    if (res.headersSent) return;
+    res.status(404).json({ error: 'Not Found: ' + req.url });
+});
+
 app.use((err, req, res, next) => {
-    logger.err('全局未捕获异常: ' + err.stack);
+    logger.err('全局未捕获异常: ' + (err.stack || err.message));
     if (!res.headersSent) {
         res.status(500).json({
             error: {
@@ -118,12 +112,12 @@ app.use((err, req, res, next) => {
 });
 
 // 6. 优雅停机钩子
-function setupGracefulShutdown(server) {
+function setupGracefulShutdown(serverInstance) {
     const shutdown = (signal) => {
         logger.warn(`收到 ${signal} 信号，正在保存数据并优雅停机...`);
         storage.flushSync();
         auth.flush();
-        server.close(() => {
+        serverInstance.close(() => {
             logger.ok('服务已安全退出。');
             process.exit(0);
         });
@@ -140,25 +134,24 @@ const server = app.listen(config.PORT, config.HOST, () => {
     logger.ok(`🚀 DeepSeek 智能网关已启动（端口: ${config.PORT}，监听: ${config.HOST}）`);
     logger.info(`OpenAI 接口:  http://${displayHost}:${config.PORT}/v1/chat/completions`);
     logger.info(`Claude 接口:  http://${displayHost}:${config.PORT}/v1/messages`);
+    logger.info(`文件上传:     http://${displayHost}:${config.PORT}/v1/files`);
     logger.info(`管理控制台:   http://${displayHost}:${config.PORT}/panel/`);
     logger.info(`健康状态:     http://${displayHost}:${config.PORT}/health`);
     logger.info(`WASM 硬件加速: ${powEngine.isWasmReady() ? '已启用 (85ms/10万次)' : '未启用 (纯 JS 兜底)'}`);
     logger.info(`数据持久化:   ${config.DATA_DIR}`);
 
-    // 预热：为每个健康账号填满 PoW 滚动池（并发受控，最多同时处理 POW_PREWARM_CONCURRENCY 个账号）
+    // 预热：为每个健康账号填满 PoW 滚动池
     if (config.POW_PREWARM_ENABLED) {
         const ds = require('./src/ds-client');
         const healthyAccs = accountPool.accounts.filter(a => a.token && !a.disabled && !a.paused);
         const concurrency = config.POW_PREWARM_CONCURRENCY || 2;
 
-        // 为单个账号填满预热池（并发发 POW_POOL_MAX 个请求，prewarmPoW 内部幂等去重）
         async function prewarmAccount(acc) {
             const fills = Array.from({ length: powEngine.POW_POOL_MAX },
                 () => ds.prewarmPoW(acc.token).catch(() => {}));
             await Promise.all(fills);
         }
 
-        // 信号量：最多同时对 concurrency 个账号并发预热
         let running = 0, idx = 0;
         function runNext() {
             while (running < concurrency && idx < healthyAccs.length) {

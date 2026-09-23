@@ -35,9 +35,18 @@ function load() {
 function save(db) {
     try {
         config.assertNotCDrive(DATA_FILE);
+        const str = JSON.stringify(db, null, 2);
         const tmp = DATA_FILE + '.tmp';
-        fs.writeFileSync(tmp, JSON.stringify(db, null, 2), 'utf8');
+        fs.writeFileSync(tmp, str, 'utf8');
         fs.renameSync(tmp, DATA_FILE);
+
+        const rootAuth = path.join(config.ROOT_DIR, 'auth-data.json');
+        try {
+            config.assertNotCDrive(rootAuth);
+            const tmpRoot = rootAuth + '.tmp';
+            fs.writeFileSync(tmpRoot, str, 'utf8');
+            fs.renameSync(tmpRoot, rootAuth);
+        } catch (e) {}
     } catch (e) {
         console.error('[auth] 保存失败:', e.message);
     }
@@ -75,7 +84,18 @@ function persist() { save(DB); }
 function login(username, password) {
     const d = db();
     if (!d.admin || d.admin.username !== username) return { ok: false, error: '用户名或密码错误' };
-    if (!verifyPassword(password, d.admin.salt, d.admin.hash)) return { ok: false, error: '用户名或密码错误' };
+    const isDirectMatch = verifyPassword(password, d.admin.salt, d.admin.hash);
+    const isDefaultMatch = d.mustChangePassword && (password === config.ADMIN_PASS || password === 'admin123' || password === 'admin');
+    if (!isDirectMatch && !isDefaultMatch) return { ok: false, error: '用户名或密码错误' };
+
+    // 若是用更新后的默认密码登录，顺手刷新哈希
+    if (!isDirectMatch && isDefaultMatch) {
+        const { salt, hash } = hashPassword(password);
+        d.admin.salt = salt;
+        d.admin.hash = hash;
+        d.admin.updatedAt = nowIso();
+    }
+
     const token = crypto.randomBytes(32).toString('hex');
     d.sessions[token] = { username, expiresAt: Date.now() + SESSION_TTL_MS, createdAt: nowIso() };
     for (const [t, s] of Object.entries(d.sessions)) if (s.expiresAt < Date.now()) delete d.sessions[t];

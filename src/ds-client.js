@@ -1,11 +1,14 @@
 'use strict';
 /**
- * src/ds-client.js — 优化的 DeepSeek 原生 HTTP 客户端
- * - Keep-Alive 连接池复用，降低并发 TCP/TLS 握手延迟
- * - 结合 WASM PoW 引擎与预热缓存（命中预热 0ms 启动）
- * - 详细业务错误码透传（40003 invalid token 等），供上层调度器精准熔断
+ * src/ds-client.js — DeepSeek 原生 HTTP 协议客户端
+ * 完美还原并增强官方逆向协议实现：
+ *  - 完整 SSE 流式数据帧解析（支持 Array fragments、多片段引用、首帧快照与状态流）
+ *  - 严格分离思考链 (thinking)、回答正文 (content)、联网搜索状态与引用 (citations)
+ *  - 结合 WASM 硬件级 PoW 加速与滚动预热池
+ *  - 独立安全 PoW 凭证（杜绝并发共享单次 PoW 导致的 400 失败）
  */
-const https = require('https');
+const path = require('path');
+const fs = require('fs');
 const config = require('./config');
 const powEngine = require('./pow-engine');
 const logger = require('./logger');
@@ -14,15 +17,7 @@ const BASE = config.DEEPSEEK.BASE;
 const TARGET_COMPLETION = config.DEEPSEEK.COMPLETION;
 const TARGET_UPLOAD = config.DEEPSEEK.UPLOAD_FILE;
 
-// 全局 Keep-Alive Agent（支持高并发复用连接，避免低配环境频繁握手）
-const httpsAgent = new https.Agent({
-    keepAlive: true,
-    keepAliveMsecs: 60000,
-    maxSockets: 100,
-    maxFreeSockets: 25,
-    timeout: 60000,
-});
-
+// 与官方 Web 客户端保持一致的请求头
 const CLIENT_HEADERS = {
     'x-client-platform': 'web',
     'x-client-version': '2.5.0',
@@ -35,6 +30,7 @@ const CLIENT_HEADERS = {
 
 const OK_CODES = new Set([0, null, undefined]);
 const STALL_TIMEOUT_MS = Number(process.env.DS_STALL_TIMEOUT_S || 90) * 1000;
+const FILE_POLL_MS = 400;
 const FILE_WAIT_MS = Number(process.env.DS_FILE_WAIT_S || 40) * 1000;
 
 class DeepSeekApiError extends Error {
@@ -63,8 +59,6 @@ async function requestJson(token, method, urlPath, body, timeoutMs = 60000) {
             headers: headersFor(token, body ? { 'content-type': 'application/json' } : {}),
             body: body ? JSON.stringify(body) : undefined,
             signal: ac.signal,
-            // @ts-ignore
-            dispatcher: undefined, // fetch 在 Node.js 环境下走原生底层
         });
 
         const text = await r.text();
@@ -73,8 +67,9 @@ async function requestJson(token, method, urlPath, body, timeoutMs = 60000) {
         }
 
         let j;
-        try { j = JSON.parse(text); }
-        catch (e) {
+        try {
+            j = JSON.parse(text);
+        } catch (e) {
             throw new DeepSeekApiError(`非 JSON 响应: ${text.slice(0, 200)}`, r.status, null, urlPath);
         }
 
@@ -94,55 +89,48 @@ async function requestJson(token, method, urlPath, body, timeoutMs = 60000) {
 }
 
 // ---------- PoW 挑战求解与预热 ----------
-const powInflight = new Map(); // 并发防抖：同账号同路径最多 1 个实时求解请求
-
+/**
+ * 获取一个可用的 PoW Header。
+ * 每一个请求必须独占一个 PoW，绝不可多请求共享（否则 DS 校验会报一次性 Token 重复使用错误）。
+ */
 async function getPowHeader(token, targetPath) {
-    // 1. 尝试从预热池取（0ms）
+    // 1. 尝试从预热池获取已预计算好的 PoW（0ms 放行）
     const cached = powEngine.powPool.get(token, targetPath);
     if (cached) {
-        const remaining = powEngine.powPool.size(token, targetPath);
-        logger.pow(`⚡ [PoW Hit] 命中预热缓存，0ms 放行！剩余池: ${remaining}/${powEngine.POW_POOL_MAX} path=${targetPath}`);
-        // 消费一个 → 立即异步补充一个，保持池满
+        logger.pow(`⚡ [PoW Hit] 命中预热缓存，0ms 放行！path=${targetPath}`);
+        // 消费一个即在后台异步补充一个，保持池满
         prewarmPoW(token, targetPath).catch(() => {});
         return cached;
     }
 
-    // 2. 并发合并防抖：同账号同路径的多个并发请求共享一次求解，避免重复打 PoW 接口
-    const key = token.slice(-12) + '|' + targetPath;
-    if (powInflight.has(key)) {
-        logger.pow(`[PoW Dedup] 合并等待已有在途求解... path=${targetPath}`);
-        return powInflight.get(key);
+    // 2. 无预热缓存时实时求解（单次独占）
+    const outer = await requestJson(token, 'POST', config.DEEPSEEK.POW_CHALLENGE, { target_path: targetPath }, 30000);
+    const ch = (outer && outer.challenge) ? outer.challenge : outer;
+    if (!ch || !ch.challenge) {
+        throw new DeepSeekApiError('取 PoW 挑战失败: ' + JSON.stringify(outer).slice(0, 200), 500, null, config.DEEPSEEK.POW_CHALLENGE);
     }
 
-    const p = (async () => {
-        const outer = await requestJson(token, 'POST', config.DEEPSEEK.POW_CHALLENGE, { target_path: targetPath }, 30000);
-        const ch = (outer && outer.challenge) ? outer.challenge : outer;
-        if (!ch || !ch.challenge) {
-            throw new DeepSeekApiError('取 PoW 挑战失败: ' + JSON.stringify(outer).slice(0, 200), 500, null, config.DEEPSEEK.POW_CHALLENGE);
-        }
-        const answer = powEngine.solve(ch);
-        if (answer < 0) throw new DeepSeekApiError('PoW 计算无解', 500, null, targetPath);
+    const t0 = Date.now();
+    const answer = powEngine.solve(ch);
+    if (answer < 0) {
+        throw new DeepSeekApiError('PoW 计算无解', 500, null, targetPath);
+    }
 
-        const header = powEngine.buildHeader(ch, answer, targetPath);
-        // 实时求解完成 → 立即异步为下一个请求预热，尽快将池填满
-        prewarmPoW(token, targetPath).catch(() => {});
-        return header;
-    })().finally(() => powInflight.delete(key));
+    const header = powEngine.buildHeader(ch, answer, targetPath);
+    logger.pow(`[PoW Solved] target=${targetPath} answer=${answer} 耗时=${Date.now() - t0}ms`);
 
-    powInflight.set(key, p);
-    return p;
+    // 实时求解后，立即触发下一个预热，加速后续调用
+    prewarmPoW(token, targetPath).catch(() => {});
+    return header;
 }
 
 /**
- * 异步预热一个 PoW 并存入滚动池。
- * 核心设计：JS 单线程，check + incrementInflight 是原子操作，不存在竞争。
- * 若「当前有效缓存 + 在途预热」已 >= POW_POOL_MAX，直接返回（幂等安全）。
+ * 异步预热一个 PoW 并存入滚动池
  */
 async function prewarmPoW(token, targetPath = TARGET_COMPLETION) {
     if (!config.POW_PREWARM_ENABLED) return;
     const pool = powEngine.powPool;
 
-    // 原子判断：已有 + 在途 是否已满（单线程保证此处不会竞争）
     const available = pool.size(token, targetPath) + pool.inflightCount(token, targetPath);
     if (available >= powEngine.POW_POOL_MAX) return;
 
@@ -156,16 +144,16 @@ async function prewarmPoW(token, targetPath = TARGET_COMPLETION) {
             const header = powEngine.buildHeader(ch, answer, targetPath);
             const expireAt = ch.expire_at ? Number(ch.expire_at) * 1000 : (Date.now() + 300000);
             pool.put(token, targetPath, header, expireAt);
-            logger.pow(`PoW 预热成功 [...${token.slice(-6)}] 池: ${pool.size(token, targetPath)}/${powEngine.POW_POOL_MAX} path=${targetPath}`);
+            logger.pow(`PoW 预热成功 [...${token.slice(-6)}] 池: ${pool.size(token, targetPath)}/${powEngine.POW_POOL_MAX}`);
         }
     } catch (e) {
-        // 预热失败静默处理，不影响主流程
+        // 预热失败静默处理
     } finally {
         pool.decrementInflight(token, targetPath);
     }
 }
 
-// ---------- 业务接口 ----------
+// ---------- 会话管理 ----------
 async function createSession(token) {
     const d = await requestJson(token, 'POST', config.DEEPSEEK.CREATE_SESSION, {}, 30000);
     const id = (d && d.chat_session && d.chat_session.id) || (d && d.id);
@@ -185,6 +173,7 @@ async function deleteSession(token, sessionId) {
     }
 }
 
+// ---------- 文件上传与等待 ----------
 async function uploadFile(token, name, buffer, mime, modelType = 'default') {
     const pow = await getPowHeader(token, TARGET_UPLOAD);
     const fd = new FormData();
@@ -207,41 +196,59 @@ async function uploadFile(token, name, buffer, mime, modelType = 'default') {
     }
 
     let j;
-    try { j = JSON.parse(text); } catch (e) { throw new DeepSeekApiError('上传非 JSON', r.status); }
-    if (!OK_CODES.has(j.code)) {
-        throw new DeepSeekApiError(`上传失败 code=${j.code} ${j.msg || ''}`, r.status, j.code, TARGET_UPLOAD);
+    try {
+        j = JSON.parse(text);
+    } catch (e) {
+        throw new DeepSeekApiError(`上传响应非 JSON: ${text.slice(0, 200)}`, r.status, null, TARGET_UPLOAD);
     }
+
+    if (!OK_CODES.has(j.code)) {
+        throw new DeepSeekApiError(`上传失败 code=${j.code} msg=${j.msg || ''}`, r.status, j.code, TARGET_UPLOAD);
+    }
+
     const d = (j.data && j.data.biz_data) || {};
-    if (!d.id) throw new DeepSeekApiError('上传成功但未返回 id', 500);
+    if (!d.id) throw new DeepSeekApiError('上传成功但未返回 file_id', 500, null, TARGET_UPLOAD);
     return d.id;
 }
 
+/** 轮询文件就绪状态 */
 async function waitFileReady(token, fileId, timeoutMs = FILE_WAIT_MS) {
     const t0 = Date.now();
     while (Date.now() - t0 < timeoutMs) {
         try {
-            const list = await requestJson(token, 'POST', config.DEEPSEEK.FILE_STATUS, { file_ids: [fileId] }, 10000);
-            const item = Array.isArray(list) ? list.find(x => x.id === fileId) : list;
-            if (item) {
-                const s = String(item.status || item.parse_status || '').toUpperCase();
-                if (s === 'SUCCESS' || s === 'COMPLETED' || s === 'PARSED') return item;
-                if (s === 'FAILED' || s === 'ERROR') throw new DeepSeekApiError('文件解析失败: ' + (item.error || s), 500);
+            const d = await requestJson(token, 'GET', `/api/v0/file/fetch_files?file_ids=${encodeURIComponent(fileId)}`, null, 20000);
+            const f = d && d.files && d.files[0];
+            if (f) {
+                if (f.status === 'SUCCESS' || f.status === 'CONTENT_EMPTY') return true;
+                if (['ERROR', 'REJECTED', 'CONTENT_FILTER'].includes(f.status)) {
+                    throw new DeepSeekApiError(`文件处理失败: ${f.status}`, 400);
+                }
             }
         } catch (e) {
-            if (e instanceof DeepSeekApiError && e.statusCode >= 400) throw e;
+            if (/文件处理失败/.test(e.message)) throw e;
         }
-        await new Promise(r => setTimeout(r, 400));
+        await new Promise(r => setTimeout(r, FILE_POLL_MS));
     }
-    throw new DeepSeekApiError(`等待文件解析超时 (${timeoutMs}ms)`, 504);
+    throw new DeepSeekApiError('文件处理超时，已放弃等待', 504);
 }
 
+// ---------- 核心流式对话 (SSE) ----------
 /**
- * 流式对话
+ * 对话调用（流式解析引擎）
+ * @param {object} opts
+ * @returns {Promise<{ content: string, thinking: string, messageId: string, tokens: number, citations: Array }>}
  */
 async function completion(opts) {
     const {
-        token, sessionId, prompt, parentMessageId,
-        thinkingEnabled, searchEnabled, refFileIds, onEvent, signal,
+        token,
+        sessionId,
+        prompt,
+        parentMessageId,
+        thinkingEnabled,
+        searchEnabled,
+        refFileIds,
+        onEvent,
+        signal,
     } = opts;
 
     const pow = await getPowHeader(token, TARGET_COMPLETION);
@@ -249,152 +256,215 @@ async function completion(opts) {
         chat_session_id: sessionId,
         parent_message_id: parentMessageId == null ? null : parentMessageId,
         model_type: 'default',
-        prompt: prompt,
+        prompt,
         ref_file_ids: Array.isArray(refFileIds) ? refFileIds : [],
         thinking_enabled: !!thinkingEnabled,
         search_enabled: searchEnabled !== false,
     };
 
     const ac = new AbortController();
+    if (signal) signal.addEventListener('abort', () => ac.abort());
     let stallTimer = null;
-
-    // 将外部 abort 信号传入内部 ac
-    if (signal) {
-        if (signal.aborted) { ac.abort(); }
-        else { signal.addEventListener('abort', () => ac.abort(), { once: true }); }
-    }
-
-    function resetStall() {
+    const resetStall = () => {
         if (stallTimer) clearTimeout(stallTimer);
         stallTimer = setTimeout(() => ac.abort(), STALL_TIMEOUT_MS);
-        if (stallTimer.unref) stallTimer.unref();
-    }
+    };
     resetStall();
 
-    let reader;
     try {
-    const r = await fetch(BASE + TARGET_COMPLETION, {
-        method: 'POST',
-        headers: headersFor(token, { 'content-type': 'application/json', 'x-ds-pow-response': pow }),
-        body: JSON.stringify(body),
-        signal: ac.signal,
-    });
+        const r = await fetch(BASE + TARGET_COMPLETION, {
+            method: 'POST',
+            headers: headersFor(token, {
+                'content-type': 'application/json',
+                'x-ds-pow-response': pow,
+            }),
+            body: JSON.stringify(body),
+            signal: ac.signal,
+        });
 
-    if (!r.ok) {
-        const t = await r.text().catch(() => '');
-        let bizCode = null;
-        try {
-            const j = JSON.parse(t);
-            bizCode = j.code || (j.data && j.data.biz_code);
-        } catch (e) {}
-        throw new DeepSeekApiError(`对话 HTTP ${r.status}: ${t.slice(0, 200)}`, r.status, bizCode, TARGET_COMPLETION);
-    }
+        if (!r.ok) {
+            const t = await r.text().catch(() => '');
+            let j = null;
+            try { j = JSON.parse(t); } catch (e) {}
+            const bizCode = j && j.code;
+            throw new DeepSeekApiError(`对话 HTTP ${r.status}: ${t.slice(0, 200)}`, r.status, bizCode, TARGET_COMPLETION);
+        }
 
-    reader = r.body.getReader();
-    const dec = new TextDecoder();
-    let buf = '';
-    let content = '';
-    let thinking = '';
-    let messageId = null;
-    let tokens = 0;
-    const citations = [];
-    let finished = false;
-    let currentType = 'text';
-    const fragmentTypes = new Map();
-    let currentFragmentId = -1;
+        const reader = r.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '';
+        let content = '';
+        let thinking = '';
+        let messageId = null;
+        let tokens = 0;
+        const citations = [];
+        let finished = false;
 
-    const emit = (type, d) => { if (d && onEvent) onEvent(type, d); };
+        // 状态机：记录当前增量是属于正文还是思考链
+        let currentType = 'text';
+        // 片段 ID -> 类型（'thinking' | 'text'）
+        const fragmentTypes = new Map();
+        let currentFragmentId = -1;
 
-    while (!finished) {
-        let chunk;
-        try { chunk = await reader.read(); } catch (e) { break; }
-        if (chunk.done) break;
-        resetStall(); // 每收到数据就重置超时
-        buf += dec.decode(chunk.value, { stream: true });
+        const emit = (type, d) => {
+            if (d && onEvent) onEvent(type, d);
+        };
 
-        let idx;
-        while ((idx = buf.indexOf('\n')) >= 0) {
-            const line = buf.slice(0, idx).trim();
-            buf = buf.slice(idx + 1);
-            if (!line.startsWith('data:')) continue;
-            const raw = line.slice(5).trim();
-            if (!raw || raw === '[DONE]') continue;
-
-            let j;
-            try { j = JSON.parse(raw); } catch (e) { continue; }
-
-            if (j.response_message_id) messageId = j.response_message_id;
-            if (j.v && typeof j.v === 'object' && j.v.response && j.v.response.message_id) {
-                messageId = j.v.response.message_id;
+        while (!finished) {
+            let chunk;
+            try {
+                chunk = await reader.read();
+            } catch (e) {
+                break;
             }
-            if (j.error) throw new DeepSeekApiError('DS 错误: ' + JSON.stringify(j.error).slice(0, 200), 500);
-            if (j.code === 'content_filter') throw new DeepSeekApiError('内容被过滤', 400);
+            if (chunk.done) break;
+            resetStall();
 
-            const p = typeof j.p === 'string' ? j.p : '';
-            if (p === 'response/accumulated_token_usage') { tokens = Number(j.v) || tokens; continue; }
-            if (/^response\/fragments\/-?\d+\/status$/.test(p)) continue;
-            if (p === 'response/search_status') { emit('search_status', j.v); continue; }
-            if (p === 'response/status' || p === 'status') {
-                if (typeof j.v === 'string' && j.v.toUpperCase() === 'FINISHED') { finished = true; break; }
-                continue;
-            }
+            buf += dec.decode(chunk.value, { stream: true });
 
-            if (p === 'response/content') { currentType = 'text'; }
-            else if (p === 'response/thinking_content') { currentType = 'thinking'; }
-            else {
-                const fm = p.match(/^response\/fragments\/(-?\d+)\/(thinking_content|content)$/);
-                if (fm) {
-                    const fid = Number(fm[1]);
-                    const field = fm[2];
-                    if (fid >= 0) {
-                        currentFragmentId = fid;
-                        currentType = field === 'thinking_content' ? 'thinking' : 'text';
-                        fragmentTypes.set(fid, currentType);
-                    } else if (fid === -1) {
-                        if (currentFragmentId >= 0 && fragmentTypes.has(currentFragmentId)) {
-                            currentType = fragmentTypes.get(currentFragmentId);
+            let idx;
+            while ((idx = buf.indexOf('\n')) >= 0) {
+                const line = buf.slice(0, idx).trim();
+                buf = buf.slice(idx + 1);
+                if (!line.startsWith('data:')) continue;
+                const raw = line.slice(5).trim();
+                if (!raw || raw === '[DONE]') continue;
+
+                let j;
+                try {
+                    j = JSON.parse(raw);
+                } catch (e) {
+                    continue;
+                }
+
+                if (j.response_message_id) messageId = j.response_message_id;
+                if (j.v && typeof j.v === 'object' && j.v.response && j.v.response.message_id) {
+                    messageId = j.v.response.message_id;
+                }
+                if (j.error) throw new DeepSeekApiError('DS 错误: ' + JSON.stringify(j.error).slice(0, 200), 500);
+                if (j.code === 'content_filter') throw new DeepSeekApiError('内容被过滤', 400);
+
+                const p = typeof j.p === 'string' ? j.p : '';
+                if (p === 'response/accumulated_token_usage') {
+                    tokens = Number(j.v) || tokens;
+                    continue;
+                }
+                if (/^response\/fragments\/-?\d+\/status$/.test(p)) continue;
+                if (p === 'response/search_status') {
+                    emit('search_status', j.v);
+                    continue;
+                }
+                if (p === 'response/status' || p === 'status') {
+                    if (typeof j.v === 'string' && j.v.toUpperCase() === 'FINISHED') {
+                        finished = true;
+                        break;
+                    }
+                    continue;
+                }
+
+                // 路径 → 类型映射判断
+                if (p === 'response/content') {
+                    currentType = 'text';
+                } else if (p === 'response/thinking_content') {
+                    currentType = 'thinking';
+                } else {
+                    const fm = p.match(/^response\/fragments\/(-?\d+)\/(thinking_content|content)$/);
+                    if (fm) {
+                        const rawId = Number(fm[1]);
+                        const fid = rawId < 0 ? currentFragmentId : rawId;
+                        // thinking_content 后缀为强特征
+                        if (/\/thinking_content$/.test(p)) {
+                            currentType = 'thinking';
                         } else {
-                            currentType = field === 'thinking_content' ? 'thinking' : 'text';
+                            const known = fragmentTypes.get(fid);
+                            currentType = known === 'thinking' ? 'thinking' : 'text';
                         }
                     }
                 }
-            }
 
-            if (p.startsWith('response/citations') && Array.isArray(j.v)) {
-                for (const c of j.v) if (c && c.url) citations.push(c);
-                continue;
-            }
-
-            if (!p && j.v && typeof j.v === 'object' && j.v.response && Array.isArray(j.v.response.fragments)) {
-                for (const frag of j.v.response.fragments) {
-                    if (frag && typeof frag.id === 'number') {
-                        currentFragmentId = frag.id;
-                        const t = String(frag.type || '').toUpperCase();
-                        const mapped = t === 'THINK' ? 'thinking' : 'text';
-                        fragmentTypes.set(frag.id, mapped);
-                        currentType = mapped;
-                        const txt = frag.content || '';
-                        if (txt) {
-                            if (mapped === 'thinking') { thinking += txt; emit('thinking', txt); }
-                            else { content += txt; emit('content', txt); }
+                // 1. 处理数组形态的 fragments: [{ id, type, content }, ...]
+                if (Array.isArray(j.v)) {
+                    for (const frag of j.v) {
+                        if (!frag || typeof frag !== 'object') continue;
+                        const ty = String(frag.type || '').toUpperCase();
+                        const isThink = (ty === 'THINK' || ty === 'THINKING');
+                        if (typeof frag.id === 'number') {
+                            fragmentTypes.set(frag.id, isThink ? 'thinking' : 'text');
+                            currentFragmentId = frag.id;
+                        }
+                        const c = typeof frag.content === 'string' ? frag.content : '';
+                        if (!c) continue;
+                        if (isThink) {
+                            thinking += c;
+                            emit('thinking', c);
+                        } else {
+                            content += c;
+                            emit('content', c);
                         }
                     }
+                    continue;
                 }
-                continue;
-            }
 
-            let delta = '';
-            if (typeof j.v === 'string') delta = j.v;
-            else if (j.v && typeof j.v.text === 'string') delta = j.v.text;
+                // 2. 处理首帧或完整快照对象
+                if (j.v && typeof j.v === 'object') {
+                    const rr = j.v.response || j.v;
+                    if (Array.isArray(rr.fragments) && rr.fragments.length) {
+                        for (const frag of rr.fragments) {
+                            if (!frag || typeof frag !== 'object') continue;
+                            const ty = String(frag.type || '').toUpperCase();
+                            const fc = typeof frag.content === 'string' ? frag.content : '';
+                            const isThink = (ty === 'THINK' || ty === 'THINKING');
+                            if (typeof frag.id === 'number') {
+                                fragmentTypes.set(frag.id, isThink ? 'thinking' : 'text');
+                                currentFragmentId = frag.id;
+                            }
+                            if (isThink) {
+                                currentType = 'thinking';
+                                if (fc) { thinking += fc; emit('thinking', fc); }
+                            } else {
+                                currentType = 'text';
+                                if (fc) { content += fc; emit('content', fc); }
+                            }
+                        }
+                    }
+                    if (typeof rr.content === 'string' && rr.content && !(rr.fragments || []).length) {
+                        content += rr.content;
+                        emit('content', rr.content);
+                    }
+                    if (typeof rr.thinking_content === 'string' && rr.thinking_content) {
+                        thinking += rr.thinking_content;
+                        emit('thinking', rr.thinking_content);
+                    }
+                    if (typeof rr.accumulated_token_usage === 'number' && rr.accumulated_token_usage) {
+                        tokens = rr.accumulated_token_usage;
+                    }
+                    continue;
+                }
 
-            if (delta) {
-                if (currentType === 'thinking') { thinking += delta; emit('thinking', delta); }
-                else { content += delta; emit('content', delta); }
+                // 3. 处理常规文本增量
+                let text = null;
+                if (typeof j.v === 'string') text = j.v;
+                if (text == null || text === '') continue;
+                if (text === 'FINISHED' && (!p || p === 'status')) {
+                    finished = true;
+                    break;
+                }
+
+                // 引用标记捕获
+                if (/\[citation:\d+\]/.test(text)) citations.push(text);
+
+                if (currentType === 'thinking') {
+                    thinking += text;
+                    emit('thinking', text);
+                } else {
+                    content += text;
+                    emit('content', text);
+                }
             }
         }
-    }
 
-    return { content, thinking, messageId, tokens, citations };
+        try { reader.cancel(); } catch (e) {}
+        return { content, thinking, messageId, tokens, citations };
     } finally {
         if (stallTimer) clearTimeout(stallTimer);
     }
