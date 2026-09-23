@@ -6,14 +6,21 @@ const express = require('express');
 const accountPool = require('../account-pool');
 const ds = require('../ds-client');
 const logger = require('../logger');
+const { requireAdmin } = require('./keys');
 
 const router = express.Router();
 
+// 全部账号管理接口需管理员登录（防未授权读取明文密码/Token）
+router.use('/api/accounts', requireAdmin);
+
 // 获取账号列表（含健康状态、熔断状态与错误信息）
+// ?reveal=1 返回明文 token/password，仅登录后可用
 router.get('/api/accounts', (req, res) => {
     const reveal = req.query.reveal === '1';
-    const list = accountPool.readRaw().map((a, i) => {
-        const poolAcc = accountPool.accounts[i];
+    const poolList = accountPool.accounts;
+    const rawList = accountPool.readRaw();
+    const list = rawList.map((a, i) => {
+        const poolAcc = poolList[i] || poolList.find(p => p.name === (a.name || ('acc' + (i + 1))));
         return {
             index: i,
             name: a.name || ('acc' + (i + 1)),
@@ -42,6 +49,12 @@ router.get('/api/accounts', (req, res) => {
     res.json({ accounts: list });
 });
 
+// 重新载入账号池（面板「重新载入」按钮）
+router.post('/api/accounts/reload', (req, res) => {
+    const n = accountPool.reload();
+    res.json({ ok: true, count: n });
+});
+
 // 新增账号
 router.post('/api/accounts', (req, res) => {
     const r = accountPool.addAccount(req.body);
@@ -49,10 +62,20 @@ router.post('/api/accounts', (req, res) => {
     res.json(r);
 });
 
-// 修改账号
+// 修改账号（token 省略或空字符串则不覆盖磁盘上的真实 Token）
 router.patch('/api/accounts/:index', (req, res) => {
     const idx = Number(req.params.index);
-    const r = accountPool.updateAccount(idx, req.body);
+    const body = { ...(req.body || {}) };
+    if (body.token !== undefined) {
+        const t = String(body.token || '').trim();
+        const looksMasked = t.includes('…') || t.includes('...');
+        if (!t || looksMasked) delete body.token;
+    }
+    if (body.password !== undefined) {
+        const p = String(body.password || '');
+        if (p === '******') delete body.password;
+    }
+    const r = accountPool.updateAccount(idx, body);
     if (!r.ok) return res.status(400).json({ error: r.error });
     res.json(r);
 });

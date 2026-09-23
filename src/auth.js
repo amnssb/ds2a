@@ -33,23 +33,20 @@ function load() {
 }
 
 function save(db) {
-    try {
-        config.assertNotCDrive(DATA_FILE);
-        const str = JSON.stringify(db, null, 2);
-        const tmp = DATA_FILE + '.tmp';
-        fs.writeFileSync(tmp, str, 'utf8');
-        fs.renameSync(tmp, DATA_FILE);
+    config.assertNotCDrive(DATA_FILE);
+    const str = JSON.stringify(db, null, 2);
+    const tmp = DATA_FILE + '.tmp';
+    fs.writeFileSync(tmp, str, 'utf8');
+    fs.renameSync(tmp, DATA_FILE);
 
+    // 根目录镜像仅作兼容；data/ 为唯一权威，镜像失败不影响主流程
+    try {
         const rootAuth = path.join(config.ROOT_DIR, 'auth-data.json');
-        try {
-            config.assertNotCDrive(rootAuth);
-            const tmpRoot = rootAuth + '.tmp';
-            fs.writeFileSync(tmpRoot, str, 'utf8');
-            fs.renameSync(tmpRoot, rootAuth);
-        } catch (e) {}
-    } catch (e) {
-        console.error('[auth] 保存失败:', e.message);
-    }
+        config.assertNotCDrive(rootAuth);
+        const tmpRoot = rootAuth + '.tmp';
+        fs.writeFileSync(tmpRoot, str, 'utf8');
+        fs.renameSync(tmpRoot, rootAuth);
+    } catch (e) {}
 }
 
 function init(envUser, envPass) {
@@ -79,27 +76,45 @@ function init(envUser, envPass) {
 
 let DB = null;
 function db() { if (!DB) DB = init(); return DB; }
-function persist() { save(DB); }
+function persist() {
+    if (!DB) return;
+    save(DB);
+}
+
+function normPw(pw) {
+    return String(pw == null ? '' : pw).trim();
+}
+
+function isDefaultPassword(pw) {
+    const p = normPw(pw);
+    return p === config.ADMIN_PASS || p === 'admin123' || p === 'admin';
+}
 
 function login(username, password) {
     const d = db();
-    if (!d.admin || d.admin.username !== username) return { ok: false, error: '用户名或密码错误' };
-    const isDirectMatch = verifyPassword(password, d.admin.salt, d.admin.hash);
-    const isDefaultMatch = d.mustChangePassword && (password === config.ADMIN_PASS || password === 'admin123' || password === 'admin');
+    const user = normPw(username);
+    const pass = normPw(password);
+    if (!d.admin || d.admin.username !== user) return { ok: false, error: '用户名或密码错误' };
+    const isDirectMatch = verifyPassword(pass, d.admin.salt, d.admin.hash);
+    const isDefaultMatch = d.mustChangePassword && isDefaultPassword(pass);
     if (!isDirectMatch && !isDefaultMatch) return { ok: false, error: '用户名或密码错误' };
 
-    // 若是用更新后的默认密码登录，顺手刷新哈希
+    // 若是用默认密码登录且尚未对齐哈希，顺手刷新哈希
     if (!isDirectMatch && isDefaultMatch) {
-        const { salt, hash } = hashPassword(password);
+        const { salt, hash } = hashPassword(pass);
         d.admin.salt = salt;
         d.admin.hash = hash;
         d.admin.updatedAt = nowIso();
     }
 
     const token = crypto.randomBytes(32).toString('hex');
-    d.sessions[token] = { username, expiresAt: Date.now() + SESSION_TTL_MS, createdAt: nowIso() };
+    d.sessions[token] = { username: user, expiresAt: Date.now() + SESSION_TTL_MS, createdAt: nowIso() };
     for (const [t, s] of Object.entries(d.sessions)) if (s.expiresAt < Date.now()) delete d.sessions[t];
-    persist();
+    try {
+        persist();
+    } catch (e) {
+        return { ok: false, error: '会话保存失败: ' + e.message };
+    }
     return { ok: true, token, mustChangePassword: !!d.mustChangePassword };
 }
 
@@ -108,26 +123,55 @@ function checkSession(token) {
     const d = db();
     const s = d.sessions[token];
     if (!s) return null;
-    if (s.expiresAt < Date.now()) { delete d.sessions[token]; persist(); return null; }
+    if (s.expiresAt < Date.now()) {
+        delete d.sessions[token];
+        try { persist(); } catch (e) {}
+        return null;
+    }
     return s;
 }
 
 function logout(token) {
     const d = db();
-    if (d.sessions[token]) { delete d.sessions[token]; persist(); return true; }
+    if (d.sessions[token]) {
+        delete d.sessions[token];
+        try { persist(); } catch (e) {}
+        return true;
+    }
     return false;
 }
 
-function changePassword(oldPw, newPw) {
+function changePassword(oldPw, newPw, keepSessionToken) {
     const d = db();
-    if (!verifyPassword(oldPw, d.admin.salt, d.admin.hash)) return { ok: false, error: '旧密码错误' };
-    if (!newPw || String(newPw).length < 4) return { ok: false, error: '新密码至少 4 位' };
-    const { salt, hash } = hashPassword(newPw);
+    if (!d.admin) return { ok: false, error: '管理员未初始化' };
+
+    const oldP = normPw(oldPw);
+    const newP = normPw(newPw);
+
+    // 与 login 对齐：hash 校验；mustChangePassword 期间同时接受默认密码回退
+    const directOk = verifyPassword(oldP, d.admin.salt, d.admin.hash);
+    const defaultOk = d.mustChangePassword && isDefaultPassword(oldP);
+    if (!directOk && !defaultOk) return { ok: false, error: '旧密码错误' };
+    if (!newP || newP.length < 4) return { ok: false, error: '新密码至少 4 位' };
+    if (newP === oldP) return { ok: false, error: '新密码不能与旧密码相同' };
+
+    const { salt, hash } = hashPassword(newP);
     d.admin.salt = salt;
     d.admin.hash = hash;
     d.admin.updatedAt = nowIso();
     d.mustChangePassword = false;
-    persist();
+
+    // 吊销除当前会话外的全部会话（改密后旧 session 立即失效）
+    const keep = keepSessionToken || '';
+    for (const t of Object.keys(d.sessions || {})) {
+        if (!keep || t !== keep) delete d.sessions[t];
+    }
+
+    try {
+        persist();
+    } catch (e) {
+        return { ok: false, error: '密码保存失败: ' + e.message };
+    }
     return { ok: true };
 }
 
@@ -145,7 +189,12 @@ function createKey(name, note) {
         enabled: true,
     };
     d.apiKeys.push(item);
-    persist();
+    try {
+        persist();
+    } catch (e) {
+        d.apiKeys.pop();
+        return { ok: false, error: 'Key 保存失败: ' + e.message };
+    }
     _invalidateKeyCache();
     return item;
 }
@@ -171,7 +220,11 @@ function updateKey(id, patch) {
     if (patch.name) k.name = String(patch.name).trim();
     if (patch.note !== undefined) k.note = String(patch.note).trim();
     if (patch.enabled !== undefined) k.enabled = !!patch.enabled;
-    persist();
+    try {
+        persist();
+    } catch (e) {
+        return { ok: false, error: 'Key 保存失败: ' + e.message };
+    }
     _invalidateKeyCache();
     return { ok: true, key: k };
 }
@@ -180,9 +233,16 @@ function deleteKey(id) {
     const d = db();
     const i = d.apiKeys.findIndex(x => x.id === id);
     if (i < 0) return { ok: false, error: 'Key 不存在' };
-    d.apiKeys.splice(i, 1);
+    const removed = d.apiKeys.splice(i, 1)[0];
+    const removedStats = d.stats.byKey[id];
     delete d.stats.byKey[id];
-    persist();
+    try {
+        persist();
+    } catch (e) {
+        d.apiKeys.splice(i, 0, removed);
+        if (removedStats) d.stats.byKey[id] = removedStats;
+        return { ok: false, error: 'Key 删除失败: ' + e.message };
+    }
     _invalidateKeyCache();
     return { ok: true };
 }
@@ -241,7 +301,9 @@ function recordUsage(info) {
 
     if (Date.now() - (recordUsage._last || 0) > 3000) {
         recordUsage._last = Date.now();
-        persist();
+        try { persist(); } catch (e) {
+            console.error('[auth] 用量落盘失败:', e.message);
+        }
     }
 }
 
@@ -256,9 +318,25 @@ function getStats() {
     };
 }
 
+function resetUsage() {
+    const d = db();
+    d.stats = {
+        total: { requests: 0, promptTokens: 0, completionTokens: 0, thinkingTokens: 0, ok: 0, err: 0, totalTokens: 0 },
+        byKey: {},
+        byAccount: {},
+        byDay: {},
+    };
+    try {
+        persist();
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
+    return { ok: true };
+}
+
 module.exports = {
     init, db, persist, flush: persist,
     login, logout, checkSession, changePassword,
     createKey, listKeys, updateKey, deleteKey, verifyApiKey,
-    recordUsage, getStats,
+    recordUsage, getStats, resetUsage,
 };

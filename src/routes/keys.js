@@ -14,7 +14,27 @@ function requireAdmin(req, res, next) {
     next();
 }
 
-router.post('/api/login', (req, res) => {
+// 简易登录限速：同来源 10 次 / 分钟，防暴力破解
+const loginHits = new Map();
+function loginRateLimit(req, res, next) {
+    const ip = req.ip || req.socket.remoteAddress || 'unknown';
+    const now = Date.now();
+    let arr = loginHits.get(ip) || [];
+    arr = arr.filter(t => now - t < 60000);
+    if (arr.length >= 10) {
+        return res.status(429).json({ error: '尝试过于频繁，请 1 分钟后再试' });
+    }
+    arr.push(now);
+    loginHits.set(ip, arr);
+    if (loginHits.size > 1000) {
+        for (const [k, v] of loginHits) {
+            if (!v.length || now - v[v.length - 1] > 60000) loginHits.delete(k);
+        }
+    }
+    next();
+}
+
+router.post('/api/login', loginRateLimit, (req, res) => {
     const { username, password } = req.body || {};
     const r = auth.login(String(username || ''), String(password || ''));
     if (!r.ok) return res.status(401).json({ error: r.error });
@@ -35,7 +55,12 @@ router.get('/api/me', (req, res) => {
 });
 
 router.post('/api/change-password', requireAdmin, (req, res) => {
-    const r = auth.changePassword(String((req.body || {}).oldPassword || ''), String((req.body || {}).newPassword || ''));
+    const body = req.body || {};
+    const r = auth.changePassword(
+        String(body.oldPassword || ''),
+        String(body.newPassword || ''),
+        req.cookies.ds_admin
+    );
     if (!r.ok) return res.status(400).json({ error: r.error });
     res.json({ ok: true });
 });
@@ -45,7 +70,11 @@ router.get('/api/keys', requireAdmin, (req, res) => {
 });
 
 router.post('/api/keys', requireAdmin, (req, res) => {
-    res.json({ ok: true, key: auth.createKey((req.body || {}).name, (req.body || {}).note) });
+    const k = auth.createKey((req.body || {}).name, (req.body || {}).note);
+    if (!k || k.ok === false) {
+        return res.status(500).json({ error: (k && k.error) || '创建失败' });
+    }
+    res.json({ ok: true, key: k });
 });
 
 router.patch('/api/keys/:id', requireAdmin, (req, res) => {
@@ -60,6 +89,17 @@ router.delete('/api/keys/:id', requireAdmin, (req, res) => {
 
 router.get('/api/usage', requireAdmin, (req, res) => {
     res.json(auth.getStats());
+});
+
+router.post('/api/usage/reset', requireAdmin, (req, res) => {
+    const r = auth.resetUsage();
+    res.status(r.ok ? 200 : 400).json(r);
+});
+
+// 兼容面板历史 GET 误用
+router.get('/api/usage/reset', requireAdmin, (req, res) => {
+    const r = auth.resetUsage();
+    res.status(r.ok ? 200 : 400).json(r);
 });
 
 module.exports = {

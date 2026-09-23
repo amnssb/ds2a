@@ -7,6 +7,30 @@ const path = require('path');
 const fs = require('fs');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
+
+// 零依赖加载 .env（不引入 dotenv；已有 process.env 优先）
+(function loadEnvFile() {
+    const envPath = path.join(ROOT_DIR, '.env');
+    try {
+        if (!fs.existsSync(envPath)) return;
+        const lines = fs.readFileSync(envPath, 'utf8').split(/\r?\n/);
+        for (const line of lines) {
+            const s = line.trim();
+            if (!s || s.startsWith('#')) continue;
+            const eq = s.indexOf('=');
+            if (eq <= 0) continue;
+            const k = s.slice(0, eq).trim();
+            let v = s.slice(eq + 1).trim();
+            if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+                v = v.slice(1, -1);
+            }
+            if (!(k in process.env)) process.env[k] = v;
+        }
+    } catch (e) {
+        console.error('[config] 加载 .env 失败:', e.message);
+    }
+})();
+
 const DATA_DIR = process.env.DS_DATA_DIR ? path.resolve(process.env.DS_DATA_DIR) : path.join(ROOT_DIR, 'data');
 const LOGS_DIR = process.env.DS_LOGS_DIR ? path.resolve(process.env.DS_LOGS_DIR) : path.join(ROOT_DIR, 'logs');
 const VENDOR_DIR = path.join(ROOT_DIR, 'vendor');
@@ -82,7 +106,7 @@ module.exports = {
 
     // 账号与并发控制
     MAX_CONCURRENT_PER_ACCOUNT: Number(process.env.DS_MAX_CONCURRENT_PER_ACCOUNT || 5),
-    CIRCUIT_BREAKER_FAIL_LIMIT: 2,         // 连续失败 2 次进入熔断
+    CIRCUIT_BREAKER_FAIL_LIMIT: Number(process.env.DS_CIRCUIT_BREAKER_FAIL_LIMIT || 2), // 连续失败 N 次进入熔断
     COOLDOWN_BASE_MS: 30000,               // 初始退避 30s
     COOLDOWN_MAX_MS: 900000,               // 最大退避 15m
 

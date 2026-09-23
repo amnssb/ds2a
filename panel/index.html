@@ -430,12 +430,14 @@ const fmtTime = t => t ? new Date(t).toLocaleTimeString('zh-CN', { hour12: false
 
 async function api(path, opts = {}) {
   const r = await fetch(path, {
-    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
     ...opts,
+    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
   });
   if (r.status === 401 && path !== '/api/login') {
     showLogin();
-    throw new Error('未登录');
+    const err = new Error('未登录或会话已过期');
+    err.status = 401;
+    throw err;
   }
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || j.msg || ('HTTP ' + r.status));
@@ -481,19 +483,21 @@ async function loadDash() {
     $('dot').className = 'dot off';
     return;
   }
-  const r = d.requests, p = d.pool;
+  const r = d.requests, p = d.pool || {};
   $('up').textContent = '运行 ' + d.uptimeHuman;
   $('wasm-badge').textContent = d.wasmAcceleration ? '⚡ WASM 加速开启' : 'JS 求解';
   $('wasm-badge').className = d.wasmAcceleration ? 'tag t-ok' : 'tag t-warn';
-  $('healthy-badge').textContent = `健康账号: ${p.healthyAccounts}/${p.accounts}`;
+  const healthyN = p.healthyAccounts != null ? p.healthyAccounts : p.healthy;
+  const totalN = p.accounts != null ? p.accounts : 0;
+  $('healthy-badge').textContent = `健康账号: ${healthyN}/${totalN}`;
 
   $('cards').innerHTML = [
     card('总请求数', fmtNum(r.total), r.perSec + ' req/s'),
     card('成功 / 失败', `<span style="color:var(--ok)">${fmtNum(r.ok)}</span> / <span style="color:${r.err?'var(--err)':'var(--dim)'}">${fmtNum(r.err)}</span>`, r.err ? '存在异常调用' : '100% 成功'),
     card('平均延迟', fmtMs(r.avgLatencyMs), '端到端往返耗时'),
-    card('健康账号', `<span style="color:var(--ok)">${p.healthyAccounts}</span> / ${p.accounts}`, '当前就绪账号数'),
-    card('并发在途', fmtNum(p.totalInflight), '当前处理中并发数'),
-    card('活跃会话', fmtNum(p.activeSessions), '上下文轮数保持'),
+    card('健康账号', `<span style="color:var(--ok)">${fmtNum(healthyN)}</span> / ${fmtNum(totalN)}`, '当前就绪账号数'),
+    card('并发在途', fmtNum(p.totalInflight || 0), '当前处理中并发数'),
+    card('活跃会话', fmtNum(p.activeSessions || 0), '上下文轮数保持'),
     card('流式输出', fmtNum(r.stream), 'SSE 实时传输'),
     card('工具调用', fmtNum(r.withTools), 'Function Calling'),
     card('思考链', fmtNum(r.withThinking), 'Reasoning 模型输出'),
@@ -523,7 +527,10 @@ async function loadDash() {
 // 2. 账号管理
 async function loadAccounts() {
   let d;
-  try { d = await api('/api/accounts'); } catch(e) { return; }
+  try { d = await api('/api/accounts'); } catch(e) {
+    $('accounts-table').innerHTML = '<div class="empty">账号加载失败: ' + esc(e.message) + '</div>';
+    return;
+  }
   const accs = d.accounts || [];
 
   $('accounts-table').innerHTML = accs.length ? '<table><thead><tr>' +
@@ -535,16 +542,19 @@ async function loadAccounts() {
       else if (a.state === 'cooldown') stateTag = `<span class="tag t-warn">冷却中 (${a.cooldownSec}s)</span>`;
       else if (a.disabled) stateTag = '<span class="tag t-dim">手动停用</span>';
 
+      const idAttr = `data-i="${a.index}" data-token-masked="${esc(a.token)}"`;
       return '<tr>' +
-        `<td><b>${esc(a.name)}</b></td>` +
-        `<td><code title="点击复制" data-copy="${esc(a.token)}">${esc(a.token.slice(0, 10))}…${esc(a.token.slice(-6))}</code></td>` +
+        `<td><b>${esc(a.name)}</b>` +
+          `<div class="muted" style="font-size:11px">${esc(a.email || a.mobile || (a.hasPassword ? '已配置密码' : '仅 Token'))}</div></td>` +
+        `<td><code title="点击复制真实 Token（需登录）" class="btn-copy-token" ${idAttr} style="cursor:pointer">${esc(a.token.slice(0, 12))}…</code></td>` +
         `<td>${stateTag}</td>` +
         `<td>在途: <b>${a.inflight||0}</b> | <span style="color:var(--ok)">${a.ok||0}</span> / <span style="color:var(--err)">${a.err||0}</span></td>` +
         `<td><span style="font-size:11px;color:${a.lastError?'var(--err)':'var(--dim)'}">${esc(a.lastError || '正常运行无异常')}</span></td>` +
         `<td><div class="flex">` +
           `<button class="btn primary btn-test-acc" data-i="${a.index}">连通测试</button>` +
+          (a.hasPassword ? `<button class="btn success btn-login-acc" data-i="${a.index}">密码登录换Token</button>` : '') +
           `<button class="btn btn-tog-acc" data-i="${a.index}" data-p="${!a.paused}">${a.paused?'恢复调度':'暂停'}</button>` +
-          `<button class="btn btn-edit-acc" data-i="${a.index}">修改 Token</button>` +
+          `<button class="btn btn-edit-acc" data-i="${a.index}">编辑账号</button>` +
           `<button class="btn danger btn-del-acc" data-i="${a.index}">删除</button>` +
         `</div></td>` +
       '</tr>';
@@ -561,6 +571,21 @@ function bindAccountEvents(accs) {
     setTimeout(() => c.textContent = old, 800);
   });
 
+  // 复制真实 Token：先拉 reveal=1 明文，再写剪贴板
+  document.querySelectorAll('.btn-copy-token').forEach(c => c.onclick = async () => {
+    try {
+      const d = await api('/api/accounts?reveal=1');
+      const a = (d.accounts || []).find(x => String(x.index) === c.dataset.i);
+      if (!a || !a.token) { alert('该账号没有 Token'); return; }
+      await navigator.clipboard.writeText(a.token);
+      const old = c.textContent;
+      c.textContent = '已复制';
+      setTimeout(() => c.textContent = old, 800);
+    } catch(e) {
+      alert('复制失败: ' + e.message);
+    }
+  });
+
   document.querySelectorAll('.btn-test-acc').forEach(b => b.onclick = async () => {
     const idx = b.dataset.i;
     b.disabled = true;
@@ -575,47 +600,91 @@ function bindAccountEvents(accs) {
     }
   });
 
+  document.querySelectorAll('.btn-login-acc').forEach(b => b.onclick = async () => {
+    if (!confirm('用该账号保存的邮箱/手机号 + 密码登录 DeepSeek，换取新 Token？')) return;
+    b.disabled = true;
+    b.textContent = '登录中...';
+    try {
+      const res = await api(`/api/accounts/${b.dataset.i}/login`, { method: 'POST' });
+      alert('登录成功，已更新 Token！\n' + (res.token ? res.token.slice(0, 12) + '…' : ''));
+    } catch(e) {
+      alert('登录失败: ' + e.message);
+    } finally {
+      loadAccounts();
+    }
+  });
+
   document.querySelectorAll('.btn-tog-acc').forEach(b => b.onclick = async () => {
     const idx = b.dataset.i;
     const shouldPause = b.dataset.p === 'true';
-    await api(`/api/accounts/${idx}/${shouldPause ? 'pause' : 'resume'}`, { method: 'POST' });
-    loadAccounts();
+    try {
+      await api(`/api/accounts/${idx}/${shouldPause ? 'pause' : 'resume'}`, { method: 'POST' });
+      loadAccounts();
+    } catch(e) { alert('操作失败: ' + e.message); }
   });
 
-  document.querySelectorAll('.btn-edit-acc').forEach(b => b.onclick = () => {
-    const a = accs.find(x => String(x.index) === b.dataset.i);
-    openModal('更新账号 ' + a.name, [
+  document.querySelectorAll('.btn-edit-acc').forEach(b => b.onclick = async () => {
+    const idx = b.dataset.i;
+    let a;
+    try {
+      // 编辑用明文（已登录才有权限），避免打码串覆盖真 Token
+      const d = await api('/api/accounts?reveal=1');
+      a = (d.accounts || []).find(x => String(x.index) === idx);
+      if (!a) throw new Error('账号不存在');
+    } catch(e) {
+      alert('读取账号失败: ' + e.message);
+      return;
+    }
+    openModal('编辑账号 ' + a.name, [
       ['账号名称', 'name', 'text', a.name],
-      ['userToken (可直接粘贴浏览器里的 token 或 JSON)', 'token', 'textarea', a.token],
+      ['邮箱 (自动登录用，可空)', 'email', 'text', a.email],
+      ['手机号 (自动登录用，可空)', 'mobile', 'text', a.mobile],
+      ['区号 (手机默认 +86)', 'areaCode', 'text', a.areaCode],
+      ['登录密码 (自动登录/换 Token 用)', 'password', 'password', a.password],
+      ['userToken (留空 = 不修改；可粘贴浏览器 token 或 JSON)', 'token', 'textarea', a.token],
     ], async val => {
-      await api('/api/accounts/' + a.index, { method: 'PATCH', body: JSON.stringify(val) });
+      const patch = { ...val };
+      // 空 token 表示不修改
+      if (!String(patch.token || '').trim()) delete patch.token;
+      await api('/api/accounts/' + a.index, { method: 'PATCH', body: JSON.stringify(patch) });
       loadAccounts();
     });
   });
 
   document.querySelectorAll('.btn-del-acc').forEach(b => b.onclick = async () => {
     if (!confirm('确定删除该账号？')) return;
-    await api('/api/accounts/' + b.dataset.i, { method: 'DELETE' });
-    loadAccounts();
+    try {
+      await api('/api/accounts/' + b.dataset.i, { method: 'DELETE' });
+      loadAccounts();
+    } catch(e) { alert('删除失败: ' + e.message); }
   });
 }
 
 $('btn-newacc').onclick = () => openModal('添加 DeepSeek 账号', [
   ['账号别名', 'name', 'text', 'acc' + (document.querySelectorAll('tr').length)],
-  ['userToken (在 chat.deepseek.com 开发者工具 Application -> LocalStorage 复制 userToken.value)', 'token', 'textarea', ''],
+  ['邮箱 (可选，用于密码自动登录)', 'email', 'text', ''],
+  ['手机号 (可选，与邮箱二选一)', 'mobile', 'text', ''],
+  ['区号 (手机号区号)', 'areaCode', 'text', '+86'],
+  ['登录密码 (可选，用于自动换 Token)', 'password', 'password', ''],
+  ['userToken (在 chat.deepseek.com 开发者工具 Application -> LocalStorage 复制 userToken.value；可与密码二选一)', 'token', 'textarea', ''],
 ], async val => {
   await api('/api/accounts', { method: 'POST', body: JSON.stringify(val) });
   loadAccounts();
 });
 $('btn-reload-accs').onclick = async () => {
-  await api('/api/accounts/reload', { method: 'POST' });
-  loadAccounts();
+  try {
+    await api('/api/accounts/reload', { method: 'POST' });
+    loadAccounts();
+  } catch(e) { alert('重新载入失败: ' + e.message); }
 };
 
 // 3. API Key 管理
 async function loadKeys() {
   let d;
-  try { d = await api('/api/keys'); } catch(e) { return; }
+  try { d = await api('/api/keys'); } catch(e) {
+    $('keys-table').innerHTML = '<div class="empty">密钥加载失败: ' + esc(e.message) + (e.status === 401 ? '（请先登录）' : '') + '</div>';
+    return;
+  }
   const keys = d.keys || [];
 
   $('keys-table').innerHTML = keys.length ? '<table><thead><tr>' +
@@ -623,9 +692,10 @@ async function loadKeys() {
     '</tr></thead><tbody>' + keys.map(k => {
       const st = k.stats || {};
       const tot = (st.promptTokens||0) + (st.completionTokens||0) + (st.thinkingTokens||0);
+      const keyShown = (k.key && k.key.length > 20) ? (k.key.slice(0, 16) + '…' + k.key.slice(-4)) : (k.key || '');
       return '<tr>' +
         `<td><b>${esc(k.name)}</b>${k.note?`<div class="muted" style="font-size:11px">${esc(k.note)}</div>`:''}</td>` +
-        `<td><code title="点击复制" data-copy="${esc(k.key)}">${esc(k.key.slice(0, 16))}…</code></td>` +
+        `<td><code title="点击复制完整 Key" data-copy="${esc(k.key)}" style="cursor:pointer">${esc(keyShown)}</code></td>` +
         `<td>${k.enabled ? '<span class="tag t-ok">生效中</span>' : '<span class="tag t-dim">已停用</span>'}</td>` +
         `<td>${fmtNum(st.requests)} <span class="muted">(${st.ok||0} 成功)</span></td>` +
         `<td><b>${fmtNum(tot)}</b> <span class="muted">(${st.promptTokens||0} / ${st.completionTokens||0} / ${st.thinkingTokens||0})</span></td>` +
@@ -637,14 +707,24 @@ async function loadKeys() {
       '</tr>';
     }).join('') + '</tbody></table>' : '<div class="empty">暂未创建 API Key，点击上方按钮创建</div>';
 
+  document.querySelectorAll('#keys-table [data-copy]').forEach(c => c.onclick = () => {
+    navigator.clipboard.writeText(c.dataset.copy);
+    const old = c.textContent;
+    c.textContent = '已复制完整 Key';
+    setTimeout(() => c.textContent = old, 1200);
+  });
   document.querySelectorAll('.btn-tog-key').forEach(b => b.onclick = async () => {
-    await api('/api/keys/' + b.dataset.kid, { method: 'PATCH', body: JSON.stringify({ enabled: b.dataset.en === 'true' }) });
-    loadKeys();
+    try {
+      await api('/api/keys/' + b.dataset.kid, { method: 'PATCH', body: JSON.stringify({ enabled: b.dataset.en === 'true' }) });
+      loadKeys();
+    } catch(e) { alert('操作失败: ' + e.message); }
   });
   document.querySelectorAll('.btn-del-key').forEach(b => b.onclick = async () => {
     if (!confirm('确定删除该 Key？')) return;
-    await api('/api/keys/' + b.dataset.kid, { method: 'DELETE' });
-    loadKeys();
+    try {
+      await api('/api/keys/' + b.dataset.kid, { method: 'DELETE' });
+      loadKeys();
+    } catch(e) { alert('删除失败: ' + e.message); }
   });
 }
 
@@ -653,14 +733,20 @@ $('btn-newkey').onclick = () => openModal('创建 API Key', [
   ['备注描述 (可选)', 'note', 'text', '用于本地/客户端调用'],
 ], async val => {
   const r = await api('/api/keys', { method: 'POST', body: JSON.stringify(val) });
-  prompt('API Key 创建成功！请复制妥善保管：', r.key.key);
+  const fullKey = r.key && r.key.key;
+  if (!fullKey) throw new Error('创建成功但未返回 Key');
+  try { await navigator.clipboard.writeText(fullKey); } catch(e) {}
+  alert('API Key 创建成功！完整 Key 已尝试复制到剪贴板，请妥善保存：\n\n' + fullKey);
   loadKeys();
 });
 
 // 4. Token 统计
 async function loadUsage() {
   let d;
-  try { d = await api('/api/usage'); } catch(e) { return; }
+  try { d = await api('/api/usage'); } catch(e) {
+    $('usage-cards').innerHTML = '<div class="empty">统计加载失败: ' + esc(e.message) + '</div>';
+    return;
+  }
   const t = d.total || {};
   const tot = (t.promptTokens||0) + (t.completionTokens||0) + (t.thinkingTokens||0);
 
@@ -712,8 +798,10 @@ async function loadUsage() {
 }
 $('btn-reset-usage').onclick = async () => {
   if (!confirm('确定重置所有 Token 统计数据？')) return;
-  await api('/api/usage/reset');
-  loadUsage();
+  try {
+    await api('/api/usage/reset', { method: 'POST' });
+    loadUsage();
+  } catch(e) { alert('重置失败: ' + e.message); }
 };
 
 // 5. 文件上传
@@ -773,7 +861,10 @@ async function doUpload(files) {
 // 6. 活跃会话
 async function loadSessions() {
   let d;
-  try { d = await api('/v1/sessions'); } catch(e) { return; }
+  try { d = await api('/v1/sessions'); } catch(e) {
+    $('sessions-table').innerHTML = '<div class="empty">会话加载失败: ' + esc(e.message) + '</div>';
+    return;
+  }
   const sList = d.sessions || [];
 
   $('sessions-table').innerHTML = sList.length ? '<table><thead><tr>' +
@@ -803,7 +894,10 @@ $('btn-clean-sess').onclick = async () => {
 async function loadLogs() {
   const statusFilter = $('log-filter-status').value;
   let d;
-  try { d = await api('/api/logs' + (statusFilter ? `?status=${statusFilter}` : '')); } catch(e) { return; }
+  try { d = await api('/api/logs' + (statusFilter ? `?status=${statusFilter}` : '')); } catch(e) {
+    $('logs-table').innerHTML = '<div class="empty">日志加载失败: ' + esc(e.message) + '</div>';
+    return;
+  }
   const list = d.logs || [];
 
   $('logs-table').innerHTML = list.length ? '<table><thead><tr>' +
@@ -864,11 +958,16 @@ function openModal(title, fields, onSubmit) {
 // ---------- 认证控制 ----------
 $('l-sub').onclick = async () => {
   const u = $('l-user').value.trim();
-  const p = $('l-pass').value.trim();
+  const p = $('l-pass').value; // 与改密一致：不 trim，避免带空格密码被裁切
   $('l-err').style.display = 'none';
   try {
-    await api('/api/login', { method: 'POST', body: JSON.stringify({ username: u, password: p }) });
+    const r = await api('/api/login', { method: 'POST', body: JSON.stringify({ username: u, password: p }) });
     hideLogin();
+    if (r.mustChangePassword) {
+      alert('检测到仍在使用初始密码，请立即修改管理员密码喵。');
+      openForceChangePassword();
+      return;
+    }
     boot();
   } catch(e) {
     $('l-err').textContent = e.message || '登录失败';
@@ -876,14 +975,36 @@ $('l-sub').onclick = async () => {
   }
 };
 $('btn-logout').onclick = async () => {
-  await api('/api/logout', { method: 'POST' });
+  try { await api('/api/logout', { method: 'POST' }); } catch(e) {}
   showLogin();
 };
+
+function openForceChangePassword() {
+  openModal('必须修改初始密码后才能继续', [
+    ['旧密码 (当前密码)', 'oldPassword', 'password'],
+    ['新密码 (至少 4 位)', 'newPassword', 'password'],
+    ['重复新密码', 'confirmPassword', 'password'],
+  ], async v => {
+    if (v.newPassword !== v.confirmPassword) throw new Error('两次新密码不一致');
+    await api('/api/change-password', { method: 'POST', body: JSON.stringify({
+      oldPassword: v.oldPassword,
+      newPassword: v.newPassword,
+    })});
+    alert('密码修改成功，正在进入控制台喵！');
+    boot();
+  });
+}
+
 $('btn-chpw').onclick = () => openModal('修改管理员密码', [
-  ['旧密码', 'oldPassword', 'password'],
+  ['旧密码 (当前密码)', 'oldPassword', 'password'],
   ['新密码 (至少 4 位)', 'newPassword', 'password'],
+  ['重复新密码', 'confirmPassword', 'password'],
 ], async v => {
-  await api('/api/change-password', { method: 'POST', body: JSON.stringify(v) });
+  if (v.newPassword !== v.confirmPassword) throw new Error('两次新密码不一致');
+  await api('/api/change-password', { method: 'POST', body: JSON.stringify({
+    oldPassword: v.oldPassword,
+    newPassword: v.newPassword,
+  })});
   alert('密码修改成功，请牢记新密码！');
 });
 $('btn-refresh').onclick = () => {
@@ -896,6 +1017,10 @@ async function boot() {
     const me = await api('/api/me');
     $('me').textContent = '已登录: ' + me.username;
     hideLogin();
+    if (me.mustChangePassword) {
+      openForceChangePassword();
+      return;
+    }
     loadDash();
   } catch(e) {
     showLogin();

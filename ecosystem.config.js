@@ -19,6 +19,7 @@ module.exports = {
             HOST: '0.0.0.0',
             DS_DATA_DIR: path.join(__dirname, 'data'),
             DS_LOGS_DIR: path.join(__dirname, 'logs'),
+            // .env 由 src/config.js 自行加载；此处不覆盖已有 process.env 语义
         },
         error_file: path.join(__dirname, 'logs', 'server.err.log'),
         out_file: path.join(__dirname, 'logs', 'server.log'),

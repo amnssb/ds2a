@@ -77,21 +77,7 @@ app.use(keysRouter);
 app.use(statsRouter);
 app.use(accountsRouter);
 
-// 4. 健康检查端点
-app.get('/health', (req, res) => {
-    const snapshot = accountPool.snapshot();
-    const healthyCount = accountPool.getHealthyCount();
-    const { sessions } = require('./src/routes/chat');
-
-    res.json({
-        status: healthyCount > 0 ? 'ok' : 'degraded',
-        healthyAccounts: healthyCount,
-        totalAccounts: snapshot.length,
-        wasmAcceleration: powEngine.isWasmReady(),
-        sessionsCount: sessions ? sessions.size : 0,
-        accounts: snapshot,
-    });
-});
+// 4. 健康检查由 src/routes/stats.js 统一提供（避免重复挂载）喵
 
 // 5. 404 与全局错误处理
 app.use((req, res, next) => {

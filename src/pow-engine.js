@@ -289,7 +289,9 @@ const powPool = new PowPool();
 
 module.exports = {
     solve,
+    solvePow: (ch, salt, expireAt, difficulty) => (typeof ch === 'object' ? solve(ch) : solve({ challenge: ch, salt, expire_at: expireAt, difficulty })),
     buildHeader,
+    buildPowHeader: buildHeader,
     powPool,
     isWasmReady: () => wasmAvailable,
     POW_POOL_MAX,

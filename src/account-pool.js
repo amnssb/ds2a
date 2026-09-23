@@ -58,7 +58,7 @@ class AccountPool {
             if (key) mergedMap.set(key, { ...item });
         }
 
-        // 若 rootList 中存在更新或不同的 token，以 rootList 优先覆盖
+        // rootList 与 dataList 同 key 时：token 变了以 root 为准并解熔断；其余字段按「非空覆盖」同步
         let rootHasNew = false;
         for (const item of rootList) {
             const key = item.name || item.token;
@@ -74,6 +74,13 @@ class AccountPool {
                     existing.paused = false;
                     existing.lastLoginError = '';
                     rootHasNew = true;
+                }
+                // 同步其余配置字段（password/email 等），避免双文件脱节
+                for (const f of ['email', 'mobile', 'areaCode', 'password', 'autoLogin', 'disabled', 'name']) {
+                    if (item[f] !== undefined && item[f] !== null && item[f] !== '' && item[f] !== existing[f]) {
+                        existing[f] = item[f];
+                        rootHasNew = true;
+                    }
                 }
             }
         }
@@ -204,8 +211,14 @@ class AccountPool {
             throw new Error(`池中全部 ${activeAccounts.length} 个账号均已在本次请求中尝试过，暂无更多可用账号喵`);
         }
 
-        // 3. 优先从未暂停 (未熔断) 且不在冷却期的账号中筛选候选者
-        const healthyCandidates = nonExcluded.filter(a => !a.paused && a.state !== STATUS.AUTH_FAILED && now >= a.disabledUntil);
+        // 3. 优先从未暂停 (未熔断) 且不在冷却期、且未达单账号并发上限的账号中筛选候选者
+        const maxPer = Math.max(1, config.MAX_CONCURRENT_PER_ACCOUNT || 5);
+        const healthyCandidates = nonExcluded.filter(a =>
+            !a.paused &&
+            a.state !== STATUS.AUTH_FAILED &&
+            now >= a.disabledUntil &&
+            (a.inflight || 0) < maxPer
+        );
 
         if (healthyCandidates.length > 0) {
             // 负载均衡：选择当前在途并发最少 (inflight 最小) 的账号
@@ -214,6 +227,16 @@ class AccountPool {
             picked.inflight = Math.max(0, (picked.inflight || 0) + 1);
             picked.lastUsedAt = now;
             this.cursor = (picked.index + 1) % n;
+            return picked;
+        }
+
+        // 3.1 全部健康账号都在途满载时，允许轻微超发而不是直接失败
+        const atCap = nonExcluded.filter(a => !a.paused && a.state !== STATUS.AUTH_FAILED && now >= a.disabledUntil);
+        if (atCap.length > 0) {
+            atCap.sort((a, b) => a.inflight - b.inflight);
+            const picked = atCap[0];
+            picked.inflight = Math.max(0, (picked.inflight || 0) + 1);
+            picked.lastUsedAt = now;
             return picked;
         }
 
@@ -300,10 +323,11 @@ class AccountPool {
         acc.state = STATUS.COOLDOWN;
         logger.warn(`账号 ${acc.name} 调用失败 ${acc.failures} 次，冷却 ${Math.round(cooldownMs / 1000)}s: ${errMsg}`);
 
-        if (acc.failures >= 3) {
+        const failLimit = Math.max(1, config.CIRCUIT_BREAKER_FAIL_LIMIT || 3);
+        if (acc.failures >= failLimit) {
             acc.state = STATUS.PAUSED;
             acc.paused = true;
-            logger.err(`账号 ${acc.name} 连续失败 3 次，已自动暂停调度！`);
+            logger.err(`账号 ${acc.name} 连续失败 ${failLimit} 次，已自动暂停调度！`);
             this.persistAccountState(acc.index, { paused: true, lastLoginError: '连续多次失败，已自动暂停' });
         }
     }

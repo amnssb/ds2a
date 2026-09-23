@@ -3,7 +3,11 @@ data/accounts.json
 data/auth-data.json
 data/stats.json
 data/requests.jsonl
+accounts.json
+auth-data.json
+server.pid
 logs/
 .env
 *.log
+*.pid
 .chrome-profiles/
