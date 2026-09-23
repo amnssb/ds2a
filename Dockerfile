@@ -21,11 +21,15 @@ FROM ${NODE_IMAGE} AS runner
 USER root
 WORKDIR /app
 
-# 安装 tini 实现精确的进程生命周期与信号传递（保障容器停机时数据落盘）
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apk/repositories || true
-RUN apk add --no-cache tini tzdata curl \
-    && cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
-    && echo "Asia/Shanghai" > /etc/timezone
+# 离线 base（由旧 ds-gateway 导出）通常已含 tini/tzdata/curl，避免再跑 apk 权限/网络问题
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apk/repositories || true; \
+    if command -v tini >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && [ -f /usr/share/zoneinfo/Asia/Shanghai ]; then \
+      echo 'skip apk: tini/curl/tzdata already present'; \
+    else \
+      apk add --no-cache tini tzdata curl; \
+    fi; \
+    cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime; \
+    echo "Asia/Shanghai" > /etc/timezone
 
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
