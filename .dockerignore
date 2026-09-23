@@ -10,3 +10,16 @@ data/*.tmp
 .env
 .DS_Store
 Thumbs.db
+# 运行时敏感数据不进镜像
+accounts.json
+auth-data.json
+data/
+logs/
+askpass.bat
+_deploy_*.py
+_probe_*.py
+_inspect_*.py
+_check_*.py
+_diag*.py
+_find_*.py
+push-tokens-headful.js

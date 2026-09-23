@@ -4,6 +4,8 @@
 # 服务器拉不到 docker.io 时可用本地基础镜像: --build-arg NODE_IMAGE=ds-node-base:20
 ARG NODE_IMAGE=node:20-alpine
 FROM ${NODE_IMAGE} AS deps
+# 本地离线 base 可能继承 USER node，构建阶段必须 root
+USER root
 WORKDIR /app
 
 # 国内/受限网络：apk 源切到清华镜像
@@ -16,6 +18,7 @@ RUN npm install --omit=dev --no-audit --ignore-scripts
 # 阶段 2: 生产运行镜像
 # ==========================================
 FROM ${NODE_IMAGE} AS runner
+USER root
 WORKDIR /app
 
 # 安装 tini 实现精确的进程生命周期与信号传递（保障容器停机时数据落盘）

@@ -1,0 +1,7 @@
+﻿services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:20-alpine}

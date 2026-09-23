@@ -99,28 +99,39 @@ class AccountPool {
 
     /** 写入磁盘（双向保证 data/accounts.json 和根目录 accounts.json 完全同步） */
     writeRaw(list) {
+        const str = JSON.stringify(list, null, 2);
+        let okData = false;
+        let okRoot = false;
+
+        // 1. 写 data/accounts.json（失败不阻断根目录同步）
         try {
             config.assertNotCDrive(this.dataFile);
-            const str = JSON.stringify(list, null, 2);
-
-            // 1. 写 data/accounts.json
+            const dir = path.dirname(this.dataFile);
+            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
             const tmpData = this.dataFile + '.tmp';
             fs.writeFileSync(tmpData, str, 'utf8');
             fs.renameSync(tmpData, this.dataFile);
-
-            // 2. 同步根目录 accounts.json
-            try {
-                config.assertNotCDrive(this.rootFile);
-                const tmpRoot = this.rootFile + '.tmp';
-                fs.writeFileSync(tmpRoot, str, 'utf8');
-                fs.renameSync(tmpRoot, this.rootFile);
-            } catch (e) {}
-
-            return true;
+            okData = true;
         } catch (e) {
-            logger.err('写入 accounts.json 失败: ' + e.message);
+            logger.err('写入 data/accounts.json 失败: ' + e.message);
+        }
+
+        // 2. 同步根目录 accounts.json
+        try {
+            config.assertNotCDrive(this.rootFile);
+            const tmpRoot = this.rootFile + '.tmp';
+            fs.writeFileSync(tmpRoot, str, 'utf8');
+            fs.renameSync(tmpRoot, this.rootFile);
+            okRoot = true;
+        } catch (e) {
+            logger.err('写入根目录 accounts.json 失败: ' + e.message);
+        }
+
+        if (!okData && !okRoot) {
+            logger.err('accounts.json 双路写入均失败，内存态可能在重启后丢失');
             return false;
         }
+        return true;
     }
 
     /** 重新载入账号并合并运行时状态 */

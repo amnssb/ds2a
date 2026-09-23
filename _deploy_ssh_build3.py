@@ -44,20 +44,23 @@ def main():
     print("SSH connected")
 
     # preserve current image as offline base if present
+    BASE = BASE_IMAGE
     rc, out = run(c, f"docker image inspect {BASE_IMAGE} >/dev/null 2>&1 && echo HAS_BASE || echo NO_BASE")
     if "HAS_BASE" not in out:
         rc, out = run(c, "docker image inspect ds-gateway:latest >/dev/null 2>&1 && echo HAS_GW || echo NO_GW")
         if "HAS_GW" in out:
             run(c, f"docker tag ds-gateway:latest {BASE_IMAGE}")
             print(f"tagged ds-gateway:latest -> {BASE_IMAGE}")
+            BASE = BASE_IMAGE
         else:
             print("WARNING: no ds-gateway image to use as base; will try docker.io")
             BASE = "node:20-alpine"
-    else:
-        BASE = BASE_IMAGE
 
     # pull latest code
     run(c, f"cd {REPO_DIR} && git fetch origin && git reset --hard origin/main && git log --oneline -3", timeout=120)
+
+    # ensure data dirs exist and are writable by container node (uid 1000)
+    run(c, f"mkdir -p {REPO_DIR}/data {REPO_DIR}/logs && chown -R 1000:1000 {REPO_DIR}/data {REPO_DIR}/logs && chmod -R 775 {REPO_DIR}/data {REPO_DIR}/logs")
 
     # ensure .env has NODE_IMAGE
     run(
@@ -87,7 +90,9 @@ def main():
             c.close()
             sys.exit(1)
 
-    run(c, f"cd {REPO_DIR} && docker compose up -d --force-recreate 2>&1", timeout=180, stream=True)
+    # rebuild after fix: re-tag base first if image was overwritten last failed attempt
+    run(c, f"mkdir -p {REPO_DIR}/data {REPO_DIR}/logs && chown -R 1000:1000 {REPO_DIR}/data {REPO_DIR}/logs")
+    run(c, f"cd {REPO_DIR} && docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --force-recreate 2>&1", timeout=180, stream=True)
     time.sleep(6)
 
     run(c, "docker ps --filter name=ds-gateway --format '{{.Names}} {{.Status}} {{.Ports}}'")
