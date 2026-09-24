@@ -30,8 +30,10 @@ const CLIENT_HEADERS = {
 
 const OK_CODES = new Set([0, null, undefined]);
 const STALL_TIMEOUT_MS = Number(process.env.DS_STALL_TIMEOUT_S || 90) * 1000;
+const THINKING_STALL_TIMEOUT_MS = Number(process.env.DS_THINKING_STALL_TIMEOUT_S || 180) * 1000;
 const FILE_POLL_MS = 400;
 const FILE_WAIT_MS = Number(process.env.DS_FILE_WAIT_S || 40) * 1000;
+const DS_DEBUG = process.env.DS_DEBUG === '1' || process.env.DS_DEBUG === 'true';
 
 class DeepSeekApiError extends Error {
     constructor(message, statusCode = 500, bizCode = null, endpoint = '') {
@@ -263,24 +265,48 @@ async function completion(opts) {
     };
 
     const ac = new AbortController();
-    if (signal) signal.addEventListener('abort', () => ac.abort());
+    let userAborted = false;
+    if (signal) {
+        if (signal.aborted) userAborted = true;
+        signal.addEventListener('abort', () => { userAborted = true; ac.abort(); });
+    }
+    const stallBudget = thinkingEnabled ? THINKING_STALL_TIMEOUT_MS : STALL_TIMEOUT_MS;
     let stallTimer = null;
+    let stalled = false;
     const resetStall = () => {
         if (stallTimer) clearTimeout(stallTimer);
-        stallTimer = setTimeout(() => ac.abort(), STALL_TIMEOUT_MS);
+        stallTimer = setTimeout(() => { stalled = true; ac.abort(); }, stallBudget);
     };
     resetStall();
 
     try {
-        const r = await fetch(BASE + TARGET_COMPLETION, {
-            method: 'POST',
-            headers: headersFor(token, {
-                'content-type': 'application/json',
-                'x-ds-pow-response': pow,
-            }),
-            body: JSON.stringify(body),
-            signal: ac.signal,
-        });
+        const extraHeaders = {
+            'content-type': 'application/json',
+            'x-ds-pow-response': pow,
+        };
+        if (thinkingEnabled) extraHeaders['x-thinking-enabled'] = '1';
+
+        let r;
+        try {
+            r = await fetch(BASE + TARGET_COMPLETION, {
+                method: 'POST',
+                headers: headersFor(token, extraHeaders),
+                body: JSON.stringify(body),
+                signal: ac.signal,
+            });
+        } catch (e) {
+            const msg = String(e && e.message || e);
+            if (stalled) {
+                throw new DeepSeekApiError(`上游流式响应停滞超时 (${Math.round(stallBudget / 1000)}s)`, 504, null, TARGET_COMPLETION);
+            }
+            if (userAborted) {
+                throw new DeepSeekApiError('客户端已中断请求', 499, null, TARGET_COMPLETION);
+            }
+            if (/abort|fetch failed|network|ECONNRESET|ETIMEDOUT|UND_ERR/i.test(msg)) {
+                throw new DeepSeekApiError(`上游网络异常: ${msg}`, 502, null, TARGET_COMPLETION);
+            }
+            throw e;
+        }
 
         if (!r.ok) {
             const t = await r.text().catch(() => '');
@@ -299,171 +325,217 @@ async function completion(opts) {
         let tokens = 0;
         const citations = [];
         let finished = false;
+        let sawAnyEvent = false;
 
         // 状态机：记录当前增量是属于正文还是思考链
         let currentType = 'text';
         // 片段 ID -> 类型（'thinking' | 'text'）
         const fragmentTypes = new Map();
         let currentFragmentId = -1;
+        let abortedMidStream = false;
 
         const emit = (type, d) => {
             if (d && onEvent) onEvent(type, d);
         };
 
-        while (!finished) {
-            let chunk;
+        const handleLine = (line) => {
+            if (!line.startsWith('data:')) return;
+            const raw = line.slice(5).trim();
+            if (!raw || raw === '[DONE]') return;
+
+            let j;
             try {
-                chunk = await reader.read();
+                j = JSON.parse(raw);
             } catch (e) {
-                break;
+                return;
             }
-            if (chunk.done) break;
-            resetStall();
 
-            buf += dec.decode(chunk.value, { stream: true });
+            sawAnyEvent = true;
+            if (DS_DEBUG) {
+                logger.info('[SSE] ' + JSON.stringify(j).slice(0, 500));
+            }
 
-            let idx;
-            while ((idx = buf.indexOf('\n')) >= 0) {
-                const line = buf.slice(0, idx).trim();
-                buf = buf.slice(idx + 1);
-                if (!line.startsWith('data:')) continue;
-                const raw = line.slice(5).trim();
-                if (!raw || raw === '[DONE]') continue;
+            if (j.response_message_id) messageId = j.response_message_id;
+            if (j.v && typeof j.v === 'object' && j.v.response && j.v.response.message_id) {
+                messageId = j.v.response.message_id;
+            }
+            if (j.error) throw new DeepSeekApiError('DS 错误: ' + JSON.stringify(j.error).slice(0, 200), 500);
+            if (j.code === 'content_filter') throw new DeepSeekApiError('内容被过滤', 400);
 
-                let j;
-                try {
-                    j = JSON.parse(raw);
-                } catch (e) {
-                    continue;
+            const p = typeof j.p === 'string' ? j.p : '';
+            if (p === 'response/accumulated_token_usage') {
+                tokens = Number(j.v) || tokens;
+                return;
+            }
+            if (/^response\/fragments\/-?\d+\/status$/.test(p)) return;
+            if (p === 'response/search_status') {
+                emit('search_status', j.v);
+                return;
+            }
+            if (p === 'response/status' || p === 'status') {
+                if (typeof j.v === 'string' && j.v.toUpperCase() === 'FINISHED') {
+                    finished = true;
                 }
+                return;
+            }
 
-                if (j.response_message_id) messageId = j.response_message_id;
-                if (j.v && typeof j.v === 'object' && j.v.response && j.v.response.message_id) {
-                    messageId = j.v.response.message_id;
-                }
-                if (j.error) throw new DeepSeekApiError('DS 错误: ' + JSON.stringify(j.error).slice(0, 200), 500);
-                if (j.code === 'content_filter') throw new DeepSeekApiError('内容被过滤', 400);
-
-                const p = typeof j.p === 'string' ? j.p : '';
-                if (p === 'response/accumulated_token_usage') {
-                    tokens = Number(j.v) || tokens;
-                    continue;
-                }
-                if (/^response\/fragments\/-?\d+\/status$/.test(p)) continue;
-                if (p === 'response/search_status') {
-                    emit('search_status', j.v);
-                    continue;
-                }
-                if (p === 'response/status' || p === 'status') {
-                    if (typeof j.v === 'string' && j.v.toUpperCase() === 'FINISHED') {
-                        finished = true;
-                        break;
-                    }
-                    continue;
-                }
-
-                // 路径 → 类型映射判断
-                if (p === 'response/content') {
-                    currentType = 'text';
-                } else if (p === 'response/thinking_content') {
-                    currentType = 'thinking';
-                } else {
-                    const fm = p.match(/^response\/fragments\/(-?\d+)\/(thinking_content|content)$/);
-                    if (fm) {
-                        const rawId = Number(fm[1]);
-                        const fid = rawId < 0 ? currentFragmentId : rawId;
-                        // thinking_content 后缀为强特征
-                        if (/\/thinking_content$/.test(p)) {
-                            currentType = 'thinking';
-                        } else {
-                            const known = fragmentTypes.get(fid);
-                            currentType = known === 'thinking' ? 'thinking' : 'text';
-                        }
+            // 路径 → 类型映射判断
+            if (p === 'response/content') {
+                currentType = 'text';
+            } else if (p === 'response/thinking_content') {
+                currentType = 'thinking';
+            } else {
+                const fm = p.match(/^response\/fragments\/(-?\d+)\/(thinking_content|content)$/);
+                if (fm) {
+                    const rawId = Number(fm[1]);
+                    const fid = rawId < 0 ? currentFragmentId : rawId;
+                    // thinking_content 后缀为强特征
+                    if (/\/thinking_content$/.test(p)) {
+                        currentType = 'thinking';
+                    } else {
+                        const known = fragmentTypes.get(fid);
+                        currentType = known === 'thinking' ? 'thinking' : 'text';
                     }
                 }
+            }
 
-                // 1. 处理数组形态的 fragments: [{ id, type, content }, ...]
-                if (Array.isArray(j.v)) {
-                    for (const frag of j.v) {
+            // 1. 处理数组形态的 fragments: [{ id, type, content }, ...]
+            if (Array.isArray(j.v)) {
+                for (const frag of j.v) {
+                    if (!frag || typeof frag !== 'object') continue;
+                    const ty = String(frag.type || '').toUpperCase();
+                    const isThink = (ty === 'THINK' || ty === 'THINKING');
+                    if (typeof frag.id === 'number') {
+                        fragmentTypes.set(frag.id, isThink ? 'thinking' : 'text');
+                        currentFragmentId = frag.id;
+                    }
+                    const c = typeof frag.content === 'string' ? frag.content : '';
+                    if (!c) continue;
+                    if (isThink) {
+                        thinking += c;
+                        emit('thinking', c);
+                    } else {
+                        content += c;
+                        emit('content', c);
+                    }
+                }
+                return;
+            }
+
+            // 2. 处理首帧或完整快照对象
+            if (j.v && typeof j.v === 'object') {
+                const rr = j.v.response || j.v;
+                if (Array.isArray(rr.fragments) && rr.fragments.length) {
+                    for (const frag of rr.fragments) {
                         if (!frag || typeof frag !== 'object') continue;
                         const ty = String(frag.type || '').toUpperCase();
+                        const fc = typeof frag.content === 'string' ? frag.content : '';
                         const isThink = (ty === 'THINK' || ty === 'THINKING');
                         if (typeof frag.id === 'number') {
                             fragmentTypes.set(frag.id, isThink ? 'thinking' : 'text');
                             currentFragmentId = frag.id;
                         }
-                        const c = typeof frag.content === 'string' ? frag.content : '';
-                        if (!c) continue;
                         if (isThink) {
-                            thinking += c;
-                            emit('thinking', c);
+                            currentType = 'thinking';
+                            if (fc) { thinking += fc; emit('thinking', fc); }
                         } else {
-                            content += c;
-                            emit('content', c);
+                            currentType = 'text';
+                            if (fc) { content += fc; emit('content', fc); }
                         }
                     }
+                } else if (typeof rr.content === 'string' && rr.content) {
+                    // 即使 fragments 数组存在但为空，也允许直接取 content/thinking_content
+                    content += rr.content;
+                    emit('content', rr.content);
+                }
+                if (typeof rr.thinking_content === 'string' && rr.thinking_content) {
+                    thinking += rr.thinking_content;
+                    emit('thinking', rr.thinking_content);
+                }
+                if (typeof rr.accumulated_token_usage === 'number' && rr.accumulated_token_usage) {
+                    tokens = rr.accumulated_token_usage;
+                }
+                return;
+            }
+
+            // 3. 处理常规文本增量
+            let text = null;
+            if (typeof j.v === 'string') text = j.v;
+            if (text == null || text === '') return;
+            if (text === 'FINISHED' && (!p || p === 'status')) {
+                finished = true;
+                return;
+            }
+
+            // 引用标记捕获
+            if (/\[citation:\d+\]/.test(text)) citations.push(text);
+
+            if (currentType === 'thinking') {
+                thinking += text;
+                emit('thinking', text);
+            } else {
+                content += text;
+                emit('content', text);
+            }
+        };
+
+        const drainBuf = () => {
+            let idx;
+            while ((idx = buf.indexOf('\n')) >= 0) {
+                const line = buf.slice(0, idx).trim();
+                buf = buf.slice(idx + 1);
+                handleLine(line);
+                if (finished) {
+                    // FINISHED 后继续冲刷同缓冲区内可能残留的正文帧
                     continue;
-                }
-
-                // 2. 处理首帧或完整快照对象
-                if (j.v && typeof j.v === 'object') {
-                    const rr = j.v.response || j.v;
-                    if (Array.isArray(rr.fragments) && rr.fragments.length) {
-                        for (const frag of rr.fragments) {
-                            if (!frag || typeof frag !== 'object') continue;
-                            const ty = String(frag.type || '').toUpperCase();
-                            const fc = typeof frag.content === 'string' ? frag.content : '';
-                            const isThink = (ty === 'THINK' || ty === 'THINKING');
-                            if (typeof frag.id === 'number') {
-                                fragmentTypes.set(frag.id, isThink ? 'thinking' : 'text');
-                                currentFragmentId = frag.id;
-                            }
-                            if (isThink) {
-                                currentType = 'thinking';
-                                if (fc) { thinking += fc; emit('thinking', fc); }
-                            } else {
-                                currentType = 'text';
-                                if (fc) { content += fc; emit('content', fc); }
-                            }
-                        }
-                    }
-                    if (typeof rr.content === 'string' && rr.content && !(rr.fragments || []).length) {
-                        content += rr.content;
-                        emit('content', rr.content);
-                    }
-                    if (typeof rr.thinking_content === 'string' && rr.thinking_content) {
-                        thinking += rr.thinking_content;
-                        emit('thinking', rr.thinking_content);
-                    }
-                    if (typeof rr.accumulated_token_usage === 'number' && rr.accumulated_token_usage) {
-                        tokens = rr.accumulated_token_usage;
-                    }
-                    continue;
-                }
-
-                // 3. 处理常规文本增量
-                let text = null;
-                if (typeof j.v === 'string') text = j.v;
-                if (text == null || text === '') continue;
-                if (text === 'FINISHED' && (!p || p === 'status')) {
-                    finished = true;
-                    break;
-                }
-
-                // 引用标记捕获
-                if (/\[citation:\d+\]/.test(text)) citations.push(text);
-
-                if (currentType === 'thinking') {
-                    thinking += text;
-                    emit('thinking', text);
-                } else {
-                    content += text;
-                    emit('content', text);
                 }
             }
+        };
+
+        try {
+            for (;;) {
+                drainBuf();
+                if (finished) break;
+
+                let chunk;
+                try {
+                    chunk = await reader.read();
+                } catch (e) {
+                    abortedMidStream = true;
+                    break;
+                }
+                if (chunk.done) break;
+                resetStall();
+                buf += dec.decode(chunk.value, { stream: true });
+            }
+            // 流结束后冲刷残留半行
+            const tail = buf.trim();
+            if (tail) {
+                try { handleLine(tail); } catch (e) { throw e; }
+            }
+        } catch (e) {
+            try { reader.cancel(); } catch (e2) {}
+            throw e;
         }
 
         try { reader.cancel(); } catch (e) {}
+
+        if (stalled && !content && !thinking) {
+            throw new DeepSeekApiError(`上游流式响应停滞超时 (${Math.round(stallBudget / 1000)}s)`, 504, null, TARGET_COMPLETION);
+        }
+        if (userAborted) {
+            throw new DeepSeekApiError('客户端已中断请求', 499, null, TARGET_COMPLETION);
+        }
+        if (abortedMidStream && !content && !thinking) {
+            throw new DeepSeekApiError('上游流式连接中断且无内容', 502, null, TARGET_COMPLETION);
+        }
+        // 空回复：触发 failover 重试，而不是静默返回 200 空正文
+        if (!content && !thinking) {
+            const hint = sawAnyEvent ? '收到事件但未解析到正文/思考内容' : '未收到任何 SSE 事件';
+            if (DS_DEBUG) logger.warn(`[SSE Empty] ${hint} finished=${finished} tokens=${tokens}`);
+            throw new DeepSeekApiError(`上游返回空响应 (${hint})`, 502, null, TARGET_COMPLETION);
+        }
+
         return { content, thinking, messageId, tokens, citations };
     } finally {
         if (stallTimer) clearTimeout(stallTimer);

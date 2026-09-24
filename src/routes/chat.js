@@ -279,14 +279,31 @@ async function executeWithFailover(opts) {
     }
 
     const excludedAccounts = [];
+    const transientRetried = new Set();
     let lastError = null;
 
-    const maxTries = Math.min(Math.max(1, accountPool.accounts.length), 5);
+    // 流式累计（execute 内闭包，供空回复校验）
+    let _streamContent = '';
+    let _streamThinking = '';
+    const contentSnapshot = () => _streamContent;
+    const thinkingSnapshot = () => _streamThinking;
 
-    for (let attempt = 0; attempt < maxTries; attempt++) {
-        // 若所有账号都已在前面尝试过，无需再次进入 acquire
+    const maxTries = Math.min(Math.max(1, accountPool.accounts.length), 5);
+    // 瞬时故障多给一次重试机会（即使只有 1 个账号）
+    const maxAttempts = Math.min(Math.max(2, maxTries + 1), 6);
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        _streamContent = '';
+        _streamThinking = '';
+        // 若所有账号都已在前面尝试过，无需再次进入 acquire（允许瞬时重试时不立刻 break）
         if (excludedAccounts.length >= accountPool.accounts.length && lastError) {
-            break;
+            const transientStill = lastError && (
+                lastError.statusCode === 502 || lastError.statusCode === 504 ||
+                /上游网络异常|空响应|连接中断|停滞超时|fetch failed/i.test(lastError.message || '')
+            );
+            if (!transientStill) break;
+            // 瞬时故障：清空排除表做最后一轮重试
+            excludedAccounts.length = 0;
         }
 
         let account = null;
@@ -341,11 +358,23 @@ async function executeWithFailover(opts) {
                 searchEnabled: search,
                 refFileIds: uploadedFileIds,
                 onEvent: (ty, d) => {
-                    if (ty === 'thinking') onThinking(d);
-                    else if (ty === 'content') onDelta(d);
+                    if (ty === 'thinking') {
+                        _streamThinking += d;
+                        onThinking(d);
+                    } else if (ty === 'content') {
+                        _streamContent += d;
+                        onDelta(d);
+                    }
                 },
                 signal,
             });
+
+            // 空回复兜底（上游有时 200 但正文/思考均为空）
+            const streamedContent = contentSnapshot();
+            const streamedThinking = thinkingSnapshot();
+            if (!r.content && !streamedContent && !r.thinking && !streamedThinking) {
+                throw Object.assign(new Error('上游返回空响应 (无正文且无思考内容)'), { statusCode: 502 });
+            }
 
             if (r.messageId) sess.parent = r.messageId;
             accountPool.markOk(account);
@@ -358,6 +387,8 @@ async function executeWithFailover(opts) {
 
             return {
                 ...r,
+                content: r.content || streamedContent,
+                thinking: r.thinking || streamedThinking,
                 accountName: account.name,
                 thinkingEnabled: thinking,
                 search,
@@ -367,8 +398,25 @@ async function executeWithFailover(opts) {
         } catch (err) {
             lastError = err;
             const bizCode = err.bizCode || (err.message && err.message.match(/code=(\d+)/) ? Number(err.message.match(/code=(\d+)/)[1]) : null);
-            accountPool.markFail(account, err, err.statusCode || 500, bizCode);
-            excludedAccounts.push(account.name);
+            // 客户端主动取消不惩罚账号
+            const clientCancel = err && (err.statusCode === 499 || /客户端已中断/i.test(err.message || ''));
+            if (!clientCancel) {
+                accountPool.markFail(account, err, err.statusCode || 500, bizCode);
+            }
+            // 瞬时网络/空响应：不立刻排除账号，允许同一请求内快速重试一次
+            const transient = !clientCancel && (
+                err.statusCode === 502 || err.statusCode === 504 ||
+                /上游网络异常|空响应|连接中断|停滞超时|fetch failed/i.test(err.message || '')
+            );
+            if (!transient) {
+                excludedAccounts.push(account.name);
+            } else if (!transientRetried.has(account.name)) {
+                // 瞬时故障仅允许同一请求内重试一次，不立刻排除
+                transientRetried.add(account.name);
+                logger.warn(`账号 ${account.name} 瞬时故障，立即重试一次: ${err.message}`);
+            } else {
+                excludedAccounts.push(account.name);
+            }
             logger.warn(`账号 ${account.name} 调用异常，正在尝试故障转移... (已排除: ${excludedAccounts.join(', ')})`);
         } finally {
             if (account) accountPool.release(account);
@@ -421,7 +469,10 @@ router.post('/v1/chat/completions', async (req, res) => {
 
     let content = '', thinking = '';
     const ac = new AbortController();
-    req.on('close', () => ac.abort());
+    // 仅在响应未完整写出时视为客户端断开；req.close 在 body 读完后也会触发，不能用
+    res.on('close', () => {
+        if (!res.writableEnded) ac.abort();
+    });
 
     const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
     const filter = createToolCallFilter(hasTools, (d) => {
@@ -519,7 +570,7 @@ router.post('/v1/chat/completions', async (req, res) => {
             endpoint: '/v1/chat/completions',
             model: body.model || 'deepseek-v4.1-flash',
             ok: false,
-            status: 500,
+            status: (e.statusCode && e.statusCode >= 400 && e.statusCode < 600) ? e.statusCode : 500,
             ms: Date.now() - t0,
             stream,
             error: e.message,
@@ -532,8 +583,9 @@ router.post('/v1/chat/completions', async (req, res) => {
             ok: false,
         });
 
+        const status = (e.statusCode && e.statusCode >= 400 && e.statusCode < 600 && e.statusCode !== 499) ? e.statusCode : 500;
         if (!res.headersSent) {
-            res.status(500).json({ error: { message: e.message, type: 'api_error' } });
+            res.status(status).json({ error: { message: e.message, type: 'api_error' } });
         } else {
             try {
                 res.write('data: ' + JSON.stringify({ error: { message: e.message } }) + '\n\n');
@@ -567,7 +619,9 @@ router.post('/v1/messages', async (req, res) => {
 
     let content = '', thinking = '';
     const ac = new AbortController();
-    req.on('close', () => ac.abort());
+    res.on('close', () => {
+        if (!res.writableEnded) ac.abort();
+    });
 
     const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
     const filter = createToolCallFilter(hasTools, (d) => {

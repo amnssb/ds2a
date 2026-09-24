@@ -334,6 +334,19 @@ class AccountPool {
             return;
         }
 
+        // 网络抖动 / 空响应 / 停滞：短暂轻冷却，不计入熔断计数，避免单账号误暂停
+        const isTransient = /上游网络异常|空响应|连接中断|停滞超时|fetch failed|AbortError|UND_ERR|ECONNRESET|ETIMEDOUT/i.test(errMsg)
+            || statusCode === 502 || statusCode === 504;
+        if (isTransient) {
+            const lightMs = 3000;
+            acc.disabledUntil = Math.max(acc.disabledUntil, Date.now() + lightMs);
+            if (acc.state !== STATUS.PAUSED && acc.state !== STATUS.AUTH_FAILED) {
+                acc.state = STATUS.COOLDOWN;
+            }
+            logger.warn(`账号 ${acc.name} 瞬时故障，轻冷却 ${Math.round(lightMs / 1000)}s（不计熔断）: ${errMsg}`);
+            return;
+        }
+
         // 普通退避冷却
         const shift = Math.min(acc.failures - 1, 5);
         const cooldownMs = Math.min(config.COOLDOWN_BASE_MS * Math.pow(2, shift), config.COOLDOWN_MAX_MS);
