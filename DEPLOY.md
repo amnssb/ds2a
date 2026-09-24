@@ -42,10 +42,13 @@ npm install
 ```bash
 # 复制环境变量配置
 cp .env.example .env
-
-# 复制账号配置文件示例
-cp accounts.example.json data/accounts.json
 ```
+
+### 3. 配置真实账号
+
+**禁止复制示例账号，也不要写入假 Token**（示例文件已移除）喵。
+
+请直接编辑 `data/accounts.json`，仅写入真实有效的 DeepSeek 账号 / Token，参见下方 [账号与 Token 配置](#账号与-token-配置) 喵。
 
 ---
 
@@ -194,10 +197,10 @@ npm run studio
 ```json
 [
   {
-    "name": "acc1",
-    "token": "YOUR_DEEPSEEK_USER_TOKEN_HERE",
-    "email": "user@example.com",
-    "password": "your_password_optional",
+    "name": "主账号昵称",
+    "token": "<chat.deepseek.com F12 获取的真实 userToken>",
+    "email": "real@example.com",
+    "password": "真实登录密码（可选）",
     "proxy": "http://127.0.0.1:7890",
     "disabled": false
   }
