@@ -641,11 +641,13 @@ function bindAccountEvents(accs) {
       ['手机号 (自动登录用，可空)', 'mobile', 'text', a.mobile],
       ['区号 (手机默认 +86)', 'areaCode', 'text', a.areaCode],
       ['登录密码 (自动登录/换 Token 用)', 'password', 'password', a.password],
+      ['代理 (每账号固定出口 IP，可空；如 http://user:pass@host:port)', 'proxy', 'text', a.proxy || ''],
       ['userToken (留空 = 不修改；可粘贴浏览器 token 或 JSON)', 'token', 'textarea', a.token],
     ], async val => {
       const patch = { ...val };
       // 空 token 表示不修改
       if (!String(patch.token || '').trim()) delete patch.token;
+      if (patch.proxy !== undefined && patch.proxy !== null) patch.proxy = String(patch.proxy || '').trim();
       await api('/api/accounts/' + a.index, { method: 'PATCH', body: JSON.stringify(patch) });
       loadAccounts();
     });
@@ -666,8 +668,10 @@ $('btn-newacc').onclick = () => openModal('添加 DeepSeek 账号', [
   ['手机号 (可选，与邮箱二选一)', 'mobile', 'text', ''],
   ['区号 (手机号区号)', 'areaCode', 'text', '+86'],
   ['登录密码 (可选，用于自动换 Token)', 'password', 'password', ''],
+  ['代理 (可选，该账号固定出口 IP；如 http://user:pass@host:port)', 'proxy', 'text', ''],
   ['userToken (在 chat.deepseek.com 开发者工具 Application -> LocalStorage 复制 userToken.value；可与密码二选一)', 'token', 'textarea', ''],
 ], async val => {
+  if (val && val.proxy !== undefined) val.proxy = String(val.proxy || '').trim();
   await api('/api/accounts', { method: 'POST', body: JSON.stringify(val) });
   loadAccounts();
 });

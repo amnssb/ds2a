@@ -40,6 +40,24 @@ const CLIENT_HEADERS = {
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
+// 账号级代理：HTTP 登录出口 IP 与 completion 保持一致，降低风控
+let _LoginProxyAgent = null;
+let _LoginProxyUrl = '';
+function loginFetchOpts(proxy, opts) {
+    const url = String(proxy || config.DEFAULT_PROXY || '').trim();
+    if (!url) return opts;
+    try {
+        const { ProxyAgent } = require('undici');
+        if (!_LoginProxyAgent || _LoginProxyUrl !== url) {
+            _LoginProxyAgent = new ProxyAgent(url);
+            _LoginProxyUrl = url;
+        }
+        return Object.assign({}, opts, { dispatcher: _LoginProxyAgent });
+    } catch (e) {
+        return opts;
+    }
+}
+
 const CHROME_CANDIDATES = [
     process.env.DS_CHROME,
     '/usr/bin/chromium-browser',
@@ -152,16 +170,16 @@ function interpret(status, ctype, text, did) {
     return { ok: false, needCode, deviceId: did, error: friendly(bizCode, msg), raw: JSON.stringify(j).slice(0, 400) };
 }
 
-async function fetchPowHeaderHttp(targetPath, timeoutMs) {
+async function fetchPowHeaderHttp(targetPath, timeoutMs, proxy) {
     try {
         const ac = new AbortController();
         const t = setTimeout(() => ac.abort(), timeoutMs || 20000);
-        const r = await fetch(BASE + POW_PATH, {
+        const r = await fetch(BASE + POW_PATH, loginFetchOpts(proxy, {
             method: 'POST',
             headers: Object.assign({}, CLIENT_HEADERS, { 'user-agent': UA }),
             body: JSON.stringify({ target_path: targetPath }),
             signal: ac.signal,
-        });
+        }));
         clearTimeout(t);
         const j = await r.json();
         const bd = (j && j.data && j.data.biz_data) || {};
@@ -188,15 +206,15 @@ async function httpLogin(o) {
         'sec-fetch-dest': 'empty',
         'accept-language': 'en-US,en;q=0.9,zh-CN;q=0.8',
     });
-    const pow = await fetchPowHeaderHttp(LOGIN_PATH);
+    const pow = await fetchPowHeaderHttp(LOGIN_PATH, 20000, o.proxy);
     if (pow) headers['x-ds-pow-response'] = pow;
 
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), Number(o.timeoutMs || 25000));
     try {
-        const r = await fetch(BASE + LOGIN_PATH, {
+        const r = await fetch(BASE + LOGIN_PATH, loginFetchOpts(o.proxy, {
             method: 'POST', headers, body: JSON.stringify(body), signal: ac.signal,
-        });
+        }));
         const text = await r.text();
         return interpret(r.status, r.headers.get('content-type'), text, did);
     } catch (e) {

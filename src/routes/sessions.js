@@ -35,7 +35,7 @@ router.delete('/v1/session/:key', requireAdmin, async (req, res) => {
         deleted = true;
         const acc = accountPool.accounts.find(a => a.token === v.token);
         if (acc) {
-            ds.deleteSession(acc.token, v.sid).catch(() => {});
+            ds.deleteSession(v.token, v.sid, v.proxy || '').catch(() => {});
         }
         logger.info(`会话 ${k} [sid: ${v.sid.slice(0, 8)}] 已主动释放`);
     }

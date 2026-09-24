@@ -31,6 +31,7 @@ router.get('/api/accounts', (req, res) => {
             hasToken: !!a.token,
             password: reveal ? (a.password || '') : (a.password ? '******' : ''),
             hasPassword: !!a.password,
+            proxy: a.proxy || '',
             autoLogin: a.autoLogin !== false,
             disabled: !!a.disabled,
             paused: !!(poolAcc ? poolAcc.paused : a.paused),
@@ -172,9 +173,9 @@ router.post('/api/accounts/:index/test', async (req, res) => {
 
     try {
         // 创建一次性会话探测 Token
-        const sid = await ds.createSession(acc.token);
+        const sid = await ds.createSession(acc.token, acc.proxy || '');
         // 探测成功后立刻删除探测会话
-        await ds.deleteSession(acc.token, sid).catch(() => {});
+        await ds.deleteSession(acc.token, sid, acc.proxy || '').catch(() => {});
         accountPool.markOk(acc);
         accountPool.resumeAccount(idx);
         res.json({ ok: true, message: 'Token 验证成功，服务正常！已恢复正常调度。' });

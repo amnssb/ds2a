@@ -21,13 +21,13 @@ const router = express.Router();
 // ---------- 会话管理（DS parent_message_id 续接） ----------
 const sessions = new Map(); // sessionKey -> { sid, parent, token, accName, lastUsed, ephemeral }
 
-// 定期清理闲置会话
+        // 定期清理闲置会话
 setInterval(async () => {
     const now = Date.now();
     for (const [k, v] of sessions.entries()) {
         if (now - v.lastUsed > config.SESSION_TTL_MS) {
             sessions.delete(k);
-            await ds.deleteSession(v.token, v.sid).catch(() => {});
+            await ds.deleteSession(v.token, v.sid, v.proxy || '').catch(() => {});
         }
     }
 }, 15000);
@@ -338,25 +338,42 @@ async function executeWithFailover(opts) {
             excludedAccounts.length = 0;
         }
 
+        // 会话粘滞账号：已有会话时优先复用原账号（sid/token 必须同账号）
+        const prevSess = sessions.get(sessionKey);
+        const preferName = prevSess && prevSess.accName ? prevSess.accName : null;
+
         let account = null;
         try {
-            account = accountPool.acquire(excludedAccounts);
+            account = accountPool.acquire(excludedAccounts, preferName);
         } catch (e) {
             throw lastError ? lastError : e;
         }
 
         try {
-            let sess = sessions.get(sessionKey);
+            let sess = prevSess;
             let isNew = !sess;
+
+            // 会话账号不一致（prefer 失败/账号被熔断换人）：丢弃旧会话重建
+            if (sess && sess.accName !== account.name) {
+                sessions.delete(sessionKey);
+                const old = sess;
+                const oldProxy = old.proxy || '';
+                ds.deleteSession(old.token, old.sid, oldProxy).catch(() => {});
+                sess = null;
+                isNew = true;
+            }
+
+            const accProxy = account.proxy || '';
 
             // 1. 会话建立
             if (!sess) {
-                const sid = await ds.createSession(account.token);
+                const sid = await ds.createSession(account.token, accProxy);
                 sess = {
                     sid,
                     parent: null,
                     token: account.token,
                     accName: account.name,
+                    proxy: accProxy,
                     lastUsed: Date.now(),
                     ephemeral: !!ephemeral,
                 };
@@ -369,8 +386,8 @@ async function executeWithFailover(opts) {
             const uploadedFileIds = [];
             if (inlineFiles.length) {
                 for (const f of inlineFiles) {
-                    const fid = await ds.uploadFile(account.token, f.name, f.data, f.mime, 'default');
-                    await ds.waitFileReady(account.token, fid, 60000);
+                    const fid = await ds.uploadFile(account.token, f.name, f.data, f.mime, 'default', accProxy);
+                    await ds.waitFileReady(account.token, fid, 60000, accProxy);
                     uploadedFileIds.push(fid);
                     logger.info(`附件已成功挂载至 DeepSeek: ${f.name} → ${fid.slice(0, 16)}`);
                 }
@@ -399,6 +416,7 @@ async function executeWithFailover(opts) {
                     }
                 },
                 signal,
+                proxy: accProxy,
             });
 
 // 空回复兜底（上游有时 200 但正文/思考均为空）
@@ -414,7 +432,7 @@ const streamedThinking = thinkingSnapshot();
             // 一次性会话清理
             if (sess.ephemeral) {
                 sessions.delete(sessionKey);
-                ds.deleteSession(account.token, sess.sid).catch(() => {});
+                ds.deleteSession(account.token, sess.sid, accProxy).catch(() => {});
             }
 
             return {
@@ -459,21 +477,21 @@ const streamedThinking = thinkingSnapshot();
 }
 
 // ===== OpenAI 兼容端点 =====
-function oaiChunk(id, delta) {
+function oaiChunk(id, delta, model) {
     return {
         id,
         object: 'chat.completion.chunk',
         created: Math.floor(Date.now() / 1000),
-        model: 'deepseek-v4.1-flash',
+        model: model || 'deepseek-v4.1-flash',
         choices: [{ index: 0, delta, finish_reason: null }],
     };
 }
-function oaiFinish(id, reason) {
+function oaiFinish(id, reason, model) {
     return {
         id,
         object: 'chat.completion.chunk',
         created: Math.floor(Date.now() / 1000),
-        model: 'deepseek-v4.1-flash',
+        model: model || 'deepseek-v4.1-flash',
         choices: [{ index: 0, delta: {}, finish_reason: reason || 'stop' }],
     };
 }
@@ -507,9 +525,17 @@ router.post('/v1/chat/completions', async (req, res) => {
     });
 
     const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
+    let oaiRoleSent = false;
     const filter = createToolCallFilter(hasTools, (d) => {
         content += d;
-        if (stream) res.write('data: ' + JSON.stringify(oaiChunk(id, { content: d })) + '\n\n');
+        if (stream) {
+            if (!oaiRoleSent) {
+                res.write('data: ' + JSON.stringify(oaiChunk(id, { role: 'assistant', content: d }, body.model)) + '\n\n');
+                oaiRoleSent = true;
+            } else {
+                res.write('data: ' + JSON.stringify(oaiChunk(id, { content: d }, body.model)) + '\n\n');
+            }
+        }
     });
 
     try {
@@ -520,11 +546,22 @@ router.post('/v1/chat/completions', async (req, res) => {
             signal: ac.signal,
             onThinking: d => {
                 thinking += d;
-                if (stream) res.write('data: ' + JSON.stringify(oaiChunk(id, { reasoning_content: d })) + '\n\n');
+                if (stream) {
+                    if (!oaiRoleSent) {
+                        res.write('data: ' + JSON.stringify(oaiChunk(id, { role: 'assistant' }, body.model)) + '\n\n');
+                        oaiRoleSent = true;
+                    }
+                    res.write('data: ' + JSON.stringify(oaiChunk(id, { reasoning_content: d }, body.model)) + '\n\n');
+                }
             },
             onDelta: d => filter.push(d),
         });
         filter.flush();
+
+        if (stream && !oaiRoleSent) {
+            res.write('data: ' + JSON.stringify(oaiChunk(id, { role: 'assistant' }, body.model)) + '\n\n');
+            oaiRoleSent = true;
+        }
 
         const rawContent = r.content || content;
         const parsed = (r.hasTools || hasTools) ? parseToolCalls(rawContent) : { content: rawContent, toolCalls: [] };
@@ -574,9 +611,9 @@ router.post('/v1/chat/completions', async (req, res) => {
         if (stream) {
             for (let i = 0; i < parsed.toolCalls.length; i++) {
                 const tc = parsed.toolCalls[i];
-                res.write('data: ' + JSON.stringify(oaiChunk(id, { tool_calls: [{ index: i, id: tc.id, type: 'function', function: { name: tc.function.name, arguments: tc.function.arguments } }] })) + '\n\n');
+                res.write('data: ' + JSON.stringify(oaiChunk(id, { tool_calls: [{ index: i, id: tc.id, type: 'function', function: { name: tc.function.name, arguments: tc.function.arguments } }] }, body.model)) + '\n\n');
             }
-            res.write('data: ' + JSON.stringify(oaiFinish(id, finish)) + '\n\n');
+            res.write('data: ' + JSON.stringify(oaiFinish(id, finish, body.model)) + '\n\n');
             // 流式末尾回传 usage（finish 后、[DONE] 前，choices 为空，兼容 stream_options.include_usage 与不带该选项的客户端）
             res.write('data: ' + JSON.stringify({
                 id,
@@ -672,13 +709,37 @@ router.post('/v1/messages', async (req, res) => {
     const filter = createToolCallFilter(hasTools, (d) => {
         content += d;
         if (stream) {
-            res.write('event: content_block_delta\ndata: ' + JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: d } }) + '\n\n');
+            res.write('event: content_block_delta\ndata: ' + JSON.stringify({ type: 'content_block_delta', index: textBlockIndex(), delta: { type: 'text_delta', text: d } }) + '\n\n');
         }
     });
 
-    if (stream) {
-        res.write('event: content_block_start\ndata: ' + JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }) + '\n\n');
-    }
+    // Claude content block 状态机：thinking 必须在 text 之前，块序号严格递增
+    let thinkBlockIdx = -1;
+    let thinkStopped = false;
+    let textIdx = -1;
+    let nextIdx = 0;
+
+    const stopThinkBlock = () => {
+        if (thinkBlockIdx < 0 || thinkStopped) return;
+        thinkStopped = true;
+        res.write('event: content_block_delta\ndata: ' + JSON.stringify({ type: 'content_block_delta', index: thinkBlockIdx, delta: { type: 'signature_delta', signature: 'sig_' + id.slice(-8) } }) + '\n\n');
+        res.write('event: content_block_stop\ndata: ' + JSON.stringify({ type: 'content_block_stop', index: thinkBlockIdx }) + '\n\n');
+    };
+
+    const textBlockIndex = () => {
+        if (textIdx >= 0) return textIdx;
+        stopThinkBlock();
+        textIdx = nextIdx++;
+        res.write('event: content_block_start\ndata: ' + JSON.stringify({ type: 'content_block_start', index: textIdx, content_block: { type: 'text', text: '' } }) + '\n\n');
+        return textIdx;
+    };
+
+    const ensureThinkBlock = () => {
+        if (thinkBlockIdx >= 0) return thinkBlockIdx;
+        thinkBlockIdx = nextIdx++;
+        res.write('event: content_block_start\ndata: ' + JSON.stringify({ type: 'content_block_start', index: thinkBlockIdx, content_block: { type: 'thinking', thinking: '', signature: '' } }) + '\n\n');
+        return thinkBlockIdx;
+    };
 
     try {
         const r = await executeWithFailover({
@@ -689,7 +750,8 @@ router.post('/v1/messages', async (req, res) => {
             onThinking: d => {
                 thinking += d;
                 if (stream) {
-                    res.write('event: content_block_delta\ndata: ' + JSON.stringify({ type: 'content_block_delta', index: 1, delta: { type: 'thinking_delta', thinking: d } }) + '\n\n');
+                    const idx = ensureThinkBlock();
+                    res.write('event: content_block_delta\ndata: ' + JSON.stringify({ type: 'content_block_delta', index: idx, delta: { type: 'thinking_delta', thinking: d } }) + '\n\n');
                 }
             },
             onDelta: d => filter.push(d),
@@ -699,6 +761,11 @@ router.post('/v1/messages', async (req, res) => {
         const rawContent = r.content || content;
         const parsed = (r.hasTools || hasTools) ? parseToolCalls(rawContent) : { content: rawContent, toolCalls: [] };
         const finish = parsed.toolCalls.length ? 'tool_use' : 'end_turn';
+
+        // 无 text 增量时也保证至少有一个 text 块（客户端期待固定块序）
+        if (stream && textIdx < 0 && !parsed.toolCalls.length) {
+            textBlockIndex();
+        }
 
         const { pTokens, cTokens, tTokens } = computeUsage(r, rawContent, thinking);
         const outTokens = cTokens + tTokens;
@@ -729,14 +796,21 @@ router.post('/v1/messages', async (req, res) => {
         });
 
         if (stream) {
-            res.write('event: content_block_stop\ndata: ' + JSON.stringify({ type: 'content_block_stop', index: 0 }) + '\n\n');
+            // 收尾：先 stop 仍在打开的 text，再 stop 尚未关闭的 thinking
+            if (textIdx >= 0) {
+                res.write('event: content_block_stop\ndata: ' + JSON.stringify({ type: 'content_block_stop', index: textIdx }) + '\n\n');
+            }
+            stopThinkBlock();
             res.write('event: message_delta\ndata: ' + JSON.stringify({ type: 'message_delta', delta: { stop_reason: finish }, usage: { output_tokens: outTokens } }) + '\n\n');
             res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
             res.end();
         } else {
+            // 非流式：thinking 必须在 text 之前，thinking 块需带 signature
             const blocks = [];
+            if (r.thinking || thinking) {
+                blocks.push({ type: 'thinking', thinking: r.thinking || thinking, signature: 'sig_' + id.slice(-8) });
+            }
             if (rawContent) blocks.push({ type: 'text', text: rawContent });
-            if (r.thinking || thinking) blocks.push({ type: 'thinking', thinking: r.thinking || thinking });
             for (const tc of parsed.toolCalls) {
                 blocks.push({
                     type: 'tool_use',

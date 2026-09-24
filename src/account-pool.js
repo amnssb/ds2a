@@ -77,7 +77,7 @@ class AccountPool {
                     rootHasNew = true;
                 }
                 // 同步其余配置字段（password/email 等），避免双文件脱节
-                for (const f of ['email', 'mobile', 'areaCode', 'password', 'autoLogin', 'disabled', 'name', 'deviceId']) {
+                for (const f of ['email', 'mobile', 'areaCode', 'password', 'autoLogin', 'disabled', 'name', 'deviceId', 'proxy']) {
                     if (item[f] !== undefined && item[f] !== null && item[f] !== '' && item[f] !== existing[f]) {
                         existing[f] = item[f];
                         rootHasNew = true;
@@ -164,6 +164,7 @@ class AccountPool {
                 areaCode: item.areaCode || '+86',
                 password: item.password || '',
                 autoLogin: item.autoLogin !== false,
+                proxy: item.proxy || '',
                 disabled: !!item.disabled,
                 paused: isPaused,
                 state,
@@ -194,12 +195,12 @@ class AccountPool {
         return this.accounts.filter(a => !a.disabled && !a.paused && a.state !== STATUS.AUTH_FAILED && a.token && now >= a.disabledUntil).length;
     }
 
-    /** 调度获取一个健康账号进行处理 */
     /**
      * 调度获取一个健康账号进行处理
      * @param {Array<string>} excludeNames - 本次请求中已尝试失败的账号名列表
+     * @param {string|null} preferName - 优先粘滞的会话原账号（仍健康时复用，避免 sid/token 错配）
      */
-    acquire(excludeNames = []) {
+    acquire(excludeNames = [], preferName = null) {
         const n = this.accounts.length;
         if (!n) {
             throw new Error('账号池为空，请在管理控制台「账号管理」中添加 DeepSeek 账号喵');
@@ -239,20 +240,46 @@ class AccountPool {
         );
 
         if (healthyCandidates.length > 0) {
-            // 负载均衡：选择当前在途并发最少 (inflight 最小) 的账号
+            // 会话粘滞：原账号仍健康则优先复用（sid 属于该账号 token）
+            if (preferName) {
+                const pref = healthyCandidates.find(a => a.name === preferName);
+                if (pref) {
+                    pref.inflight = Math.max(0, (pref.inflight || 0) + 1);
+                    pref.lastUsedAt = now;
+                    this.cursor = (pref.index + 1) % n;
+                    return pref;
+                }
+            }
+
+            // 负载均衡：min inflight 分组 + 组内 round-robin（修复串行请求死磕第一个账号）
             healthyCandidates.sort((a, b) => a.inflight - b.inflight);
-            const picked = healthyCandidates[0];
+            const minInflight = healthyCandidates[0].inflight;
+            const tied = healthyCandidates.filter(a => a.inflight === minInflight);
+            const start = ((this.cursor % tied.length) + tied.length) % tied.length;
+            const picked = tied[start];
+            this.cursor = (start + 1) % tied.length;
             picked.inflight = Math.max(0, (picked.inflight || 0) + 1);
             picked.lastUsedAt = now;
-            this.cursor = (picked.index + 1) % n;
             return picked;
         }
 
         // 3.1 全部健康账号都在途满载时，允许轻微超发而不是直接失败
         const atCap = nonExcluded.filter(a => !a.paused && a.state !== STATUS.AUTH_FAILED && now >= a.disabledUntil);
         if (atCap.length > 0) {
+            if (preferName) {
+                const pref = atCap.find(a => a.name === preferName);
+                if (pref) {
+                    pref.inflight = Math.max(0, (pref.inflight || 0) + 1);
+                    pref.lastUsedAt = now;
+                    return pref;
+                }
+            }
             atCap.sort((a, b) => a.inflight - b.inflight);
-            const picked = atCap[0];
+            const minInflight = atCap[0].inflight;
+            const tied = atCap.filter(a => a.inflight === minInflight);
+            const start = ((this.cursor % tied.length) + tied.length) % tied.length;
+            const picked = tied[start];
+            this.cursor = (start + 1) % tied.length;
             picked.inflight = Math.max(0, (picked.inflight || 0) + 1);
             picked.lastUsedAt = now;
             return picked;
@@ -421,6 +448,7 @@ class AccountPool {
             areaCode: String(accData.areaCode || '+86').trim(),
             password: String(accData.password || '').trim(),
             autoLogin: accData.autoLogin !== false,
+            proxy: String(accData.proxy || '').trim(),
             disabled: !!accData.disabled,
             paused: false,
             lastLoginError: '',
@@ -463,6 +491,7 @@ class AccountPool {
         if (patch.areaCode !== undefined) target.areaCode = String(patch.areaCode).trim();
         if (patch.password !== undefined) target.password = String(patch.password).trim();
         if (patch.deviceId !== undefined) target.deviceId = String(patch.deviceId).trim();
+        if (patch.proxy !== undefined) target.proxy = String(patch.proxy).trim();
         if (patch.autoLogin !== undefined) target.autoLogin = !!patch.autoLogin;
         if (patch.disabled !== undefined) target.disabled = !!patch.disabled;
         if (patch.paused !== undefined) target.paused = !!patch.paused;
@@ -544,6 +573,7 @@ class AccountPool {
                 lastLoginAt: a.lastLoginAt || '',
                 lastUsedAt: p ? p.lastUsedAt : 0,
                 deviceId: a.deviceId || '',
+                proxy: a.proxy || '',
             };
         });
     }
@@ -582,6 +612,7 @@ class AccountPool {
             const areaCode = item.areaCode !== undefined ? String(item.areaCode || '').trim() : null;
             const password = item.password !== undefined ? String(item.password || '').trim() : null;
             const deviceId = item.deviceId !== undefined ? String(item.deviceId || '').trim() : null;
+            const proxy = item.proxy !== undefined ? String(item.proxy || '').trim() : null;
             const lastLoginAt = item.lastLoginAt ? String(item.lastLoginAt) : null;
             const autoLogin = item.autoLogin !== undefined ? !!item.autoLogin : null;
 
@@ -600,6 +631,7 @@ class AccountPool {
                 if (areaCode !== null && areaCode && areaCode !== t.areaCode) { t.areaCode = areaCode; dirty = true; }
                 if (password !== null && password && password !== t.password) { t.password = password; dirty = true; }
                 if (deviceId !== null && deviceId && deviceId !== t.deviceId) { t.deviceId = deviceId; dirty = true; }
+                if (proxy !== null && proxy !== t.proxy) { t.proxy = proxy; dirty = true; }
                 if (lastLoginAt && lastLoginAt !== t.lastLoginAt) { t.lastLoginAt = lastLoginAt; dirty = true; }
                 if (autoLogin !== null && autoLogin !== t.autoLogin) { t.autoLogin = autoLogin; dirty = true; }
                 // 仅显式 forceDisabled 才允许客户端改服务端禁用态
@@ -620,6 +652,7 @@ class AccountPool {
                     lastLoginError: '',
                     lastLoginAt: lastLoginAt || '',
                     deviceId: deviceId || '',
+                    proxy: proxy || '',
                 });
                 byName.set(name, raw.length - 1);
                 created++;

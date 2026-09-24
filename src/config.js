@@ -104,6 +104,9 @@ module.exports = {
     REQUEST_TIMEOUT_MS: Number(process.env.DS_TIMEOUT_MS || 90000),
     MAX_UPLOAD_MB: Number(process.env.DS_MAX_UPLOAD_MB || 30),
 
+    // 全局默认代理（账号未单独配置 proxy 时使用，如 http://user:pass@host:port）
+    DEFAULT_PROXY: process.env.DS_DEFAULT_PROXY || '',
+
     // 账号与并发控制
     MAX_CONCURRENT_PER_ACCOUNT: Number(process.env.DS_MAX_CONCURRENT_PER_ACCOUNT || 5),
     CIRCUIT_BREAKER_FAIL_LIMIT: Number(process.env.DS_CIRCUIT_BREAKER_FAIL_LIMIT || 2), // 连续失败 N 次进入熔断

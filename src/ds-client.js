@@ -35,6 +35,44 @@ const FILE_POLL_MS = 400;
 const FILE_WAIT_MS = Number(process.env.DS_FILE_WAIT_S || 40) * 1000;
 const DS_DEBUG = process.env.DS_DEBUG === '1' || process.env.DS_DEBUG === 'true';
 
+// ---------- 账号级代理（undici ProxyAgent） ----------
+let ProxyAgentClass = null;
+try {
+    ProxyAgentClass = require('undici').ProxyAgent;
+} catch (e) {
+    ProxyAgentClass = null;
+}
+const _dispatcherCache = new Map();
+
+function resolveProxyUrl(proxy) {
+    const p = String(proxy || '').trim();
+    if (p) return p;
+    const d = String(config.DEFAULT_PROXY || '').trim();
+    return d;
+}
+
+function dispatcherFor(proxy) {
+    const url = resolveProxyUrl(proxy);
+    if (!url || !ProxyAgentClass) return undefined;
+    let agent = _dispatcherCache.get(url);
+    if (!agent) {
+        agent = new ProxyAgentClass(url);
+        _dispatcherCache.set(url, agent);
+    }
+    return agent;
+}
+
+function withProxy(proxy, opts) {
+    const d = dispatcherFor(proxy);
+    return d ? Object.assign({}, opts, { dispatcher: d }) : opts;
+}
+
+/** PoW 池键：同 token 不同出口 IP 不能混用 */
+function powCacheKey(token, proxy) {
+    const p = resolveProxyUrl(proxy);
+    return p ? (token + '@@' + p) : token;
+}
+
 class DeepSeekApiError extends Error {
     constructor(message, statusCode = 500, bizCode = null, endpoint = '') {
         super(message);
@@ -52,16 +90,16 @@ function headersFor(token, extra) {
     }, CLIENT_HEADERS, extra || {});
 }
 
-async function requestJson(token, method, urlPath, body, timeoutMs = 60000) {
+async function requestJson(token, method, urlPath, body, timeoutMs = 60000, proxy = '') {
     const ac = new AbortController();
     const t = setTimeout(() => ac.abort(), timeoutMs);
     try {
-        const r = await fetch(BASE + urlPath, {
+        const r = await fetch(BASE + urlPath, withProxy(proxy, {
             method,
             headers: headersFor(token, body ? { 'content-type': 'application/json' } : {}),
             body: body ? JSON.stringify(body) : undefined,
             signal: ac.signal,
-        });
+        }));
 
         const text = await r.text();
         if (r.status >= 400) {
@@ -95,18 +133,19 @@ async function requestJson(token, method, urlPath, body, timeoutMs = 60000) {
  * 获取一个可用的 PoW Header。
  * 每一个请求必须独占一个 PoW，绝不可多请求共享（否则 DS 校验会报一次性 Token 重复使用错误）。
  */
-async function getPowHeader(token, targetPath) {
+async function getPowHeader(token, targetPath, proxy = '') {
+    const cacheKey = powCacheKey(token, proxy);
     // 1. 尝试从预热池获取已预计算好的 PoW（0ms 放行）
-    const cached = powEngine.powPool.get(token, targetPath);
+    const cached = powEngine.powPool.get(cacheKey, targetPath);
     if (cached) {
         logger.pow(`⚡ [PoW Hit] 命中预热缓存，0ms 放行！path=${targetPath}`);
         // 消费一个即在后台异步补充一个，保持池满
-        prewarmPoW(token, targetPath).catch(() => {});
+        prewarmPoW(token, targetPath, proxy).catch(() => {});
         return cached;
     }
 
     // 2. 无预热缓存时实时求解（单次独占）
-    const outer = await requestJson(token, 'POST', config.DEEPSEEK.POW_CHALLENGE, { target_path: targetPath }, 30000);
+    const outer = await requestJson(token, 'POST', config.DEEPSEEK.POW_CHALLENGE, { target_path: targetPath }, 30000, proxy);
     const ch = (outer && outer.challenge) ? outer.challenge : outer;
     if (!ch || !ch.challenge) {
         throw new DeepSeekApiError('取 PoW 挑战失败: ' + JSON.stringify(outer).slice(0, 200), 500, null, config.DEEPSEEK.POW_CHALLENGE);
@@ -122,42 +161,43 @@ async function getPowHeader(token, targetPath) {
     logger.pow(`[PoW Solved] target=${targetPath} answer=${answer} 耗时=${Date.now() - t0}ms`);
 
     // 实时求解后，立即触发下一个预热，加速后续调用
-    prewarmPoW(token, targetPath).catch(() => {});
+    prewarmPoW(token, targetPath, proxy).catch(() => {});
     return header;
 }
 
 /**
  * 异步预热一个 PoW 并存入滚动池
  */
-async function prewarmPoW(token, targetPath = TARGET_COMPLETION) {
+async function prewarmPoW(token, targetPath = TARGET_COMPLETION, proxy = '') {
     if (!config.POW_PREWARM_ENABLED) return;
     const pool = powEngine.powPool;
+    const cacheKey = powCacheKey(token, proxy);
 
-    const available = pool.size(token, targetPath) + pool.inflightCount(token, targetPath);
+    const available = pool.size(cacheKey, targetPath) + pool.inflightCount(cacheKey, targetPath);
     if (available >= powEngine.POW_POOL_MAX) return;
 
-    pool.incrementInflight(token, targetPath);
+    pool.incrementInflight(cacheKey, targetPath);
     try {
-        const outer = await requestJson(token, 'POST', config.DEEPSEEK.POW_CHALLENGE, { target_path: targetPath }, 30000);
+        const outer = await requestJson(token, 'POST', config.DEEPSEEK.POW_CHALLENGE, { target_path: targetPath }, 30000, proxy);
         const ch = (outer && outer.challenge) ? outer.challenge : outer;
         if (!ch || !ch.challenge) return;
         const answer = powEngine.solve(ch);
         if (answer >= 0) {
             const header = powEngine.buildHeader(ch, answer, targetPath);
             const expireAt = ch.expire_at ? Number(ch.expire_at) * 1000 : (Date.now() + 300000);
-            pool.put(token, targetPath, header, expireAt);
-            logger.pow(`PoW 预热成功 [...${token.slice(-6)}] 池: ${pool.size(token, targetPath)}/${powEngine.POW_POOL_MAX}`);
+            pool.put(cacheKey, targetPath, header, expireAt);
+            logger.pow(`PoW 预热成功 [...${token.slice(-6)}] 池: ${pool.size(cacheKey, targetPath)}/${powEngine.POW_POOL_MAX}`);
         }
     } catch (e) {
         // 预热失败静默处理
     } finally {
-        pool.decrementInflight(token, targetPath);
+        pool.decrementInflight(cacheKey, targetPath);
     }
 }
 
 // ---------- 会话管理 ----------
-async function createSession(token) {
-    const d = await requestJson(token, 'POST', config.DEEPSEEK.CREATE_SESSION, {}, 30000);
+async function createSession(token, proxy = '') {
+    const d = await requestJson(token, 'POST', config.DEEPSEEK.CREATE_SESSION, {}, 30000, proxy);
     const id = (d && d.chat_session && d.chat_session.id) || (d && d.id);
     if (!id) {
         throw new DeepSeekApiError('创建会话失败: ' + JSON.stringify(d).slice(0, 200), 500, null, config.DEEPSEEK.CREATE_SESSION);
@@ -165,10 +205,10 @@ async function createSession(token) {
     return id;
 }
 
-async function deleteSession(token, sessionId) {
+async function deleteSession(token, sessionId, proxy = '') {
     if (!sessionId) return false;
     try {
-        await requestJson(token, 'POST', config.DEEPSEEK.DELETE_SESSION, { chat_session_id: sessionId }, 15000);
+        await requestJson(token, 'POST', config.DEEPSEEK.DELETE_SESSION, { chat_session_id: sessionId }, 15000, proxy);
         return true;
     } catch (e) {
         return false;
@@ -176,12 +216,12 @@ async function deleteSession(token, sessionId) {
 }
 
 // ---------- 文件上传与等待 ----------
-async function uploadFile(token, name, buffer, mime, modelType = 'default') {
-    const pow = await getPowHeader(token, TARGET_UPLOAD);
+async function uploadFile(token, name, buffer, mime, modelType = 'default', proxy = '') {
+    const pow = await getPowHeader(token, TARGET_UPLOAD, proxy);
     const fd = new FormData();
     fd.append('file', new Blob([buffer], { type: mime || 'application/octet-stream' }), name);
 
-    const r = await fetch(BASE + TARGET_UPLOAD, {
+    const r = await fetch(BASE + TARGET_UPLOAD, withProxy(proxy, {
         method: 'POST',
         headers: headersFor(token, {
             'x-ds-pow-response': pow,
@@ -190,7 +230,7 @@ async function uploadFile(token, name, buffer, mime, modelType = 'default') {
             'x-thinking-enabled': '1',
         }),
         body: fd,
-    });
+    }));
 
     const text = await r.text();
     if (r.status >= 400) {
@@ -214,11 +254,11 @@ async function uploadFile(token, name, buffer, mime, modelType = 'default') {
 }
 
 /** 轮询文件就绪状态 */
-async function waitFileReady(token, fileId, timeoutMs = FILE_WAIT_MS) {
+async function waitFileReady(token, fileId, timeoutMs = FILE_WAIT_MS, proxy = '') {
     const t0 = Date.now();
     while (Date.now() - t0 < timeoutMs) {
         try {
-            const d = await requestJson(token, 'GET', `/api/v0/file/fetch_files?file_ids=${encodeURIComponent(fileId)}`, null, 20000);
+            const d = await requestJson(token, 'GET', `/api/v0/file/fetch_files?file_ids=${encodeURIComponent(fileId)}`, null, 20000, proxy);
             const f = d && d.files && d.files[0];
             if (f) {
                 if (f.status === 'SUCCESS' || f.status === 'CONTENT_EMPTY') return true;
@@ -251,9 +291,10 @@ async function completion(opts) {
         refFileIds,
         onEvent,
         signal,
+        proxy,
     } = opts;
 
-    const pow = await getPowHeader(token, TARGET_COMPLETION);
+    const pow = await getPowHeader(token, TARGET_COMPLETION, proxy);
     const body = {
         chat_session_id: sessionId,
         parent_message_id: parentMessageId == null ? null : parentMessageId,
@@ -288,12 +329,12 @@ async function completion(opts) {
 
         let r;
         try {
-            r = await fetch(BASE + TARGET_COMPLETION, {
+            r = await fetch(BASE + TARGET_COMPLETION, withProxy(proxy, {
                 method: 'POST',
                 headers: headersFor(token, extraHeaders),
                 body: JSON.stringify(body),
                 signal: ac.signal,
-            });
+            }));
         } catch (e) {
             const msg = String(e && e.message || e);
             if (stalled) {
@@ -397,11 +438,14 @@ async function completion(opts) {
                         currentType = known === 'thinking' ? 'thinking' : 'text';
                     }
                 } else {
-                    // 未知路径兜底：直接尝试从 j.v 提取正文/思考内容
-                    // 避免上游协议变更导致已收到事件但解析不到内容
+                    // 未知路径兜底：仅在字段名能自证类型时提取，避免 stale currentType 误分类
                     if (DS_DEBUG) logger.warn(`[SSE] 未知路径 p="${p}"，尝试从 j.v 提取内容`);
+                    const pathSaysThink = /thinking|think/i.test(p);
+                    const pathSaysText = /(^|\/)(content|text)(_|$)/i.test(p) && !pathSaysThink;
                     if (typeof j.v === 'string') {
-                        if (currentType === 'thinking') { thinking += j.v; emit('thinking', j.v); }
+                        if (pathSaysThink) { thinking += j.v; emit('thinking', j.v); }
+                        else if (pathSaysText) { content += j.v; emit('content', j.v); }
+                        else if (currentType === 'thinking') { thinking += j.v; emit('thinking', j.v); }
                         else { content += j.v; emit('content', j.v); }
                     } else if (j.v && typeof j.v === 'object') {
                         const rr = j.v.response || j.v;
@@ -440,6 +484,7 @@ async function completion(opts) {
             // 2. 处理首帧或完整快照对象
             if (j.v && typeof j.v === 'object') {
                 const rr = j.v.response || j.v;
+                let gotThinkFromFragments = false;
                 if (Array.isArray(rr.fragments) && rr.fragments.length) {
                     for (const frag of rr.fragments) {
                         if (!frag || typeof frag !== 'object') continue;
@@ -452,7 +497,7 @@ async function completion(opts) {
                         }
                         if (isThink) {
                             currentType = 'thinking';
-                            if (fc) { thinking += fc; emit('thinking', fc); }
+                            if (fc) { gotThinkFromFragments = true; thinking += fc; emit('thinking', fc); }
                         } else {
                             currentType = 'text';
                             if (fc) { content += fc; emit('content', fc); }
@@ -463,7 +508,8 @@ async function completion(opts) {
                     content += rr.content;
                     emit('content', rr.content);
                 }
-                if (typeof rr.thinking_content === 'string' && rr.thinking_content) {
+                // fragments 已含 thinking 时禁止再叠加 thinking_content（修复双计数）
+                if (!gotThinkFromFragments && typeof rr.thinking_content === 'string' && rr.thinking_content) {
                     thinking += rr.thinking_content;
                     emit('thinking', rr.thinking_content);
                 }
