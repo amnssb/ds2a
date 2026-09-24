@@ -396,6 +396,21 @@ async function completion(opts) {
                         const known = fragmentTypes.get(fid);
                         currentType = known === 'thinking' ? 'thinking' : 'text';
                     }
+                } else {
+                    // 未知路径兜底：直接尝试从 j.v 提取正文/思考内容
+                    // 避免上游协议变更导致已收到事件但解析不到内容
+                    if (DS_DEBUG) logger.warn(`[SSE] 未知路径 p="${p}"，尝试从 j.v 提取内容`);
+                    if (typeof j.v === 'string') {
+                        if (currentType === 'thinking') { thinking += j.v; emit('thinking', j.v); }
+                        else { content += j.v; emit('content', j.v); }
+                    } else if (j.v && typeof j.v === 'object') {
+                        const rr = j.v.response || j.v;
+                        if (typeof rr.content === 'string' && rr.content) { content += rr.content; emit('content', rr.content); }
+                        if (typeof rr.thinking_content === 'string' && rr.thinking_content) { thinking += rr.thinking_content; emit('thinking', rr.thinking_content); }
+                        if (typeof j.v.text === 'string' && j.v.text) { content += j.v.text; emit('content', j.v.text); }
+                        if (typeof j.v.thinking === 'string' && j.v.thinking) { thinking += j.v.thinking; emit('thinking', j.v.thinking); }
+                    }
+                    return;
                 }
             }
 
@@ -493,9 +508,14 @@ async function completion(opts) {
         };
 
         try {
+            let finishedDraining = false;
             for (;;) {
                 drainBuf();
-                if (finished) break;
+                if (finished) {
+                    // 状态已结束但可能还有残留内容帧在网络中，继续读取冲刷
+                    if (finishedDraining) break;
+                    finishedDraining = true;
+                }
 
                 let chunk;
                 try {
@@ -505,7 +525,7 @@ async function completion(opts) {
                     break;
                 }
                 if (chunk.done) break;
-                resetStall();
+                if (!finished) resetStall();
                 buf += dec.decode(chunk.value, { stream: true });
             }
             // 流结束后冲刷残留半行
@@ -529,11 +549,15 @@ async function completion(opts) {
         if (abortedMidStream && !content && !thinking) {
             throw new DeepSeekApiError('上游流式连接中断且无内容', 502, null, TARGET_COMPLETION);
         }
-        // 空回复：触发 failover 重试，而不是静默返回 200 空正文
+        // 空回复：仅在完全未收到任何 SSE 事件时才触发 failover；
+        // 若已收到事件但解析到空内容，视为上游有效空响应，不触发重试
         if (!content && !thinking) {
-            const hint = sawAnyEvent ? '收到事件但未解析到正文/思考内容' : '未收到任何 SSE 事件';
-            if (DS_DEBUG) logger.warn(`[SSE Empty] ${hint} finished=${finished} tokens=${tokens}`);
-            throw new DeepSeekApiError(`上游返回空响应 (${hint})`, 502, null, TARGET_COMPLETION);
+            if (!sawAnyEvent) {
+                const hint = '未收到任何 SSE 事件';
+                if (DS_DEBUG) logger.warn(`[SSE Empty] ${hint} finished=${finished} tokens=${tokens}`);
+                throw new DeepSeekApiError(`上游返回空响应 (${hint})`, 502, null, TARGET_COMPLETION);
+            }
+            if (DS_DEBUG) logger.warn(`[SSE] 收到事件但无正文/思考内容，视为有效空响应 finished=${finished} tokens=${tokens}`);
         }
 
         return { content, thinking, messageId, tokens, citations };

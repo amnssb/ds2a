@@ -369,12 +369,12 @@ async function executeWithFailover(opts) {
                 signal,
             });
 
-            // 空回复兜底（上游有时 200 但正文/思考均为空）
-            const streamedContent = contentSnapshot();
-            const streamedThinking = thinkingSnapshot();
-            if (!r.content && !streamedContent && !r.thinking && !streamedThinking) {
-                throw Object.assign(new Error('上游返回空响应 (无正文且无思考内容)'), { statusCode: 502 });
-            }
+// 空回复兜底（上游有时 200 但正文/思考均为空）
+// 与 ds-client.js 保持一致：仅当完全未收到 SSE 事件时才视为空回复
+// 若上游返回了事件但内容为空，视为有效响应（可能是上游临时空内容）
+// ds-client 已在流结束时处理 sawAnyEvent 逻辑，此处不再额外抛异常
+const streamedContent = contentSnapshot();
+const streamedThinking = thinkingSnapshot();
 
             if (r.messageId) sess.parent = r.messageId;
             accountPool.markOk(account);
