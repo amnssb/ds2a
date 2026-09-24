@@ -35,29 +35,185 @@ const FILE_POLL_MS = 400;
 const FILE_WAIT_MS = Number(process.env.DS_FILE_WAIT_S || 40) * 1000;
 const DS_DEBUG = process.env.DS_DEBUG === '1' || process.env.DS_DEBUG === 'true';
 
-// ---------- 账号级代理（undici ProxyAgent） ----------
+const net = require('net');
+const tls = require('tls');
+
+// ---------- 账号级独立代理（HTTP/HTTPS/SOCKS5） ----------
 let ProxyAgentClass = null;
+let AgentClass = null;
 try {
-    ProxyAgentClass = require('undici').ProxyAgent;
+    const undici = require('undici');
+    ProxyAgentClass = undici.ProxyAgent;
+    AgentClass = undici.Agent;
 } catch (e) {
     ProxyAgentClass = null;
+    AgentClass = null;
 }
 const _dispatcherCache = new Map();
 
 function resolveProxyUrl(proxy) {
-    const p = String(proxy || '').trim();
-    if (p) return p;
-    const d = String(config.DEFAULT_PROXY || '').trim();
-    return d;
+    let p = String(proxy || '').trim();
+    if (!p) p = String(config.DEFAULT_PROXY || '').trim();
+    if (!p) return '';
+    // 若未填协议头，自动补全 http://
+    if (!/^[a-zA-Z0-9]+:\/\//.test(p)) {
+        p = 'http://' + p;
+    }
+    // 容器内环境优化：若在 Docker 容器内且指向 127.0.0.1 或 localhost，自动映射为宿主机 host.docker.internal
+    if (process.env.DOCKER_CONTAINER === '1' || fs.existsSync('/.dockerenv')) {
+        try {
+            const u = new URL(p);
+            if (u.hostname === '127.0.0.1' || u.hostname === 'localhost') {
+                u.hostname = process.env.HOST_GATEWAY_NAME || 'host.docker.internal';
+                p = u.toString();
+            }
+        } catch (e) {}
+    }
+    return p;
+}
+
+function createSocks5Connector(socksUrlStr) {
+    let u;
+    try { u = new URL(socksUrlStr); } catch (e) { return null; }
+    const socksHost = u.hostname;
+    const socksPort = Number(u.port) || 1080;
+    const authUser = u.username ? decodeURIComponent(u.username) : '';
+    const authPass = u.password ? decodeURIComponent(u.password) : '';
+
+    return function connect(opts, callback) {
+        const targetHost = opts.hostname;
+        const targetPort = Number(opts.port) || (opts.protocol === 'https:' ? 443 : 80);
+        const isHttps = opts.protocol === 'https:' || targetPort === 443;
+
+        const socket = net.connect({ host: socksHost, port: socksPort });
+        let stage = 0;
+        let buf = Buffer.alloc(0);
+
+        const cleanup = () => {
+            socket.removeAllListeners('data');
+            socket.removeAllListeners('error');
+        };
+
+        socket.once('error', (err) => {
+            cleanup();
+            callback(err, null);
+        });
+
+        socket.on('data', (chunk) => {
+            buf = Buffer.concat([buf, chunk]);
+            if (stage === 0) {
+                if (buf.length < 2) return;
+                const ver = buf[0];
+                const method = buf[1];
+                buf = buf.subarray(2);
+                if (ver !== 5) {
+                    cleanup();
+                    socket.destroy();
+                    return callback(new Error('SOCKS5 协议版本错误: ' + ver), null);
+                }
+                if (method === 0x02) {
+                    stage = 1;
+                    const uBuf = Buffer.from(authUser, 'utf8');
+                    const pBuf = Buffer.from(authPass, 'utf8');
+                    const authReq = Buffer.concat([
+                        Buffer.from([0x01, uBuf.length]),
+                        uBuf,
+                        Buffer.from([pBuf.length]),
+                        pBuf
+                    ]);
+                    socket.write(authReq);
+                    return;
+                } else if (method === 0x00) {
+                    sendConnectReq();
+                    return;
+                } else {
+                    cleanup();
+                    socket.destroy();
+                    return callback(new Error('SOCKS5 代理认证方式不支持: ' + method), null);
+                }
+            }
+            if (stage === 1) {
+                if (buf.length < 2) return;
+                const status = buf[1];
+                buf = buf.subarray(2);
+                if (status !== 0) {
+                    cleanup();
+                    socket.destroy();
+                    return callback(new Error('SOCKS5 认证失败'), null);
+                }
+                sendConnectReq();
+                return;
+            }
+            if (stage === 2) {
+                if (buf.length < 4) return;
+                const rep = buf[1];
+                const atyp = buf[3];
+                let minLen = 4;
+                if (atyp === 1) minLen += 4 + 2;
+                else if (atyp === 3) minLen += 1 + (buf.length > 4 ? buf[4] : 0) + 2;
+                else if (atyp === 4) minLen += 16 + 2;
+                if (buf.length < minLen) return;
+
+                cleanup();
+                if (rep !== 0) {
+                    socket.destroy();
+                    return callback(new Error('SOCKS5 代理连接目标失败, rep=' + rep), null);
+                }
+
+                if (buf.length > minLen) {
+                    const rest = buf.subarray(minLen);
+                    socket.unshift(rest);
+                }
+
+                if (isHttps) {
+                    const tlsSocket = tls.connect({
+                        socket,
+                        servername: targetHost,
+                        rejectUnauthorized: true,
+                    });
+                    tlsSocket.once('error', (err) => callback(err, null));
+                    tlsSocket.once('secureConnect', () => callback(null, tlsSocket));
+                } else {
+                    callback(null, socket);
+                }
+            }
+        });
+
+        function sendConnectReq() {
+            stage = 2;
+            const hostBuf = Buffer.from(targetHost, 'utf8');
+            const portBuf = Buffer.alloc(2);
+            portBuf.writeUInt16BE(targetPort, 0);
+            const req = Buffer.concat([
+                Buffer.from([0x05, 0x01, 0x00, 0x03, hostBuf.length]),
+                hostBuf,
+                portBuf
+            ]);
+            socket.write(req);
+        }
+
+        const hasAuth = !!(authUser || authPass);
+        const greeting = hasAuth
+            ? Buffer.from([0x05, 0x02, 0x00, 0x02])
+            : Buffer.from([0x05, 0x01, 0x00]);
+        socket.write(greeting);
+    };
 }
 
 function dispatcherFor(proxy) {
     const url = resolveProxyUrl(proxy);
-    if (!url || !ProxyAgentClass) return undefined;
+    if (!url) return undefined;
     let agent = _dispatcherCache.get(url);
     if (!agent) {
-        agent = new ProxyAgentClass(url);
-        _dispatcherCache.set(url, agent);
+        if (/^socks5h?:\/\//i.test(url) && AgentClass) {
+            const connector = createSocks5Connector(url);
+            if (connector) {
+                agent = new AgentClass({ connect: connector });
+            }
+        } else if (ProxyAgentClass) {
+            agent = new ProxyAgentClass(url);
+        }
+        if (agent) _dispatcherCache.set(url, agent);
     }
     return agent;
 }
@@ -420,45 +576,7 @@ async function completion(opts) {
                 return;
             }
 
-            // 路径 → 类型映射判断
-            if (p === 'response/content') {
-                currentType = 'text';
-            } else if (p === 'response/thinking_content') {
-                currentType = 'thinking';
-            } else {
-                const fm = p.match(/^response\/fragments\/(-?\d+)\/(thinking_content|content)$/);
-                if (fm) {
-                    const rawId = Number(fm[1]);
-                    const fid = rawId < 0 ? currentFragmentId : rawId;
-                    // thinking_content 后缀为强特征
-                    if (/\/thinking_content$/.test(p)) {
-                        currentType = 'thinking';
-                    } else {
-                        const known = fragmentTypes.get(fid);
-                        currentType = known === 'thinking' ? 'thinking' : 'text';
-                    }
-                } else {
-                    // 未知路径兜底：仅在字段名能自证类型时提取，避免 stale currentType 误分类
-                    if (DS_DEBUG) logger.warn(`[SSE] 未知路径 p="${p}"，尝试从 j.v 提取内容`);
-                    const pathSaysThink = /thinking|think/i.test(p);
-                    const pathSaysText = /(^|\/)(content|text)(_|$)/i.test(p) && !pathSaysThink;
-                    if (typeof j.v === 'string') {
-                        if (pathSaysThink) { thinking += j.v; emit('thinking', j.v); }
-                        else if (pathSaysText) { content += j.v; emit('content', j.v); }
-                        else if (currentType === 'thinking') { thinking += j.v; emit('thinking', j.v); }
-                        else { content += j.v; emit('content', j.v); }
-                    } else if (j.v && typeof j.v === 'object') {
-                        const rr = j.v.response || j.v;
-                        if (typeof rr.content === 'string' && rr.content) { content += rr.content; emit('content', rr.content); }
-                        if (typeof rr.thinking_content === 'string' && rr.thinking_content) { thinking += rr.thinking_content; emit('thinking', rr.thinking_content); }
-                        if (typeof j.v.text === 'string' && j.v.text) { content += j.v.text; emit('content', j.v.text); }
-                        if (typeof j.v.thinking === 'string' && j.v.thinking) { thinking += j.v.thinking; emit('thinking', j.v.thinking); }
-                    }
-                    return;
-                }
-            }
-
-            // 1. 处理数组形态的 fragments: [{ id, type, content }, ...]
+            // 1. 处理数组形态的 fragments: [{ id, type, content }, ...] (如 response/fragments APPEND)
             if (Array.isArray(j.v)) {
                 for (const frag of j.v) {
                     if (!frag || typeof frag !== 'object') continue;
@@ -468,6 +586,7 @@ async function completion(opts) {
                         fragmentTypes.set(frag.id, isThink ? 'thinking' : 'text');
                         currentFragmentId = frag.id;
                     }
+                    currentType = isThink ? 'thinking' : 'text';
                     const c = typeof frag.content === 'string' ? frag.content : '';
                     if (!c) continue;
                     if (isThink) {
@@ -481,7 +600,7 @@ async function completion(opts) {
                 return;
             }
 
-            // 2. 处理首帧或完整快照对象
+            // 2. 处理完整快照对象或单个 fragment 对象
             if (j.v && typeof j.v === 'object') {
                 const rr = j.v.response || j.v;
                 let gotThinkFromFragments = false;
@@ -503,12 +622,24 @@ async function completion(opts) {
                             if (fc) { content += fc; emit('content', fc); }
                         }
                     }
+                } else if (typeof rr.type === 'string' && (rr.type === 'THINK' || rr.type === 'RESPONSE' || rr.type === 'TEXT')) {
+                    // 单个 fragment 对象 (如 {"p":"response/fragments/0", "v":{"id":0, "type":"THINK"}})
+                    const ty = String(rr.type).toUpperCase();
+                    const isThink = (ty === 'THINK' || ty === 'THINKING');
+                    if (typeof rr.id === 'number') {
+                        fragmentTypes.set(rr.id, isThink ? 'thinking' : 'text');
+                        currentFragmentId = rr.id;
+                    }
+                    currentType = isThink ? 'thinking' : 'text';
+                    const fc = typeof rr.content === 'string' ? rr.content : '';
+                    if (fc) {
+                        if (isThink) { thinking += fc; emit('thinking', fc); }
+                        else { content += fc; emit('content', fc); }
+                    }
                 } else if (typeof rr.content === 'string' && rr.content) {
-                    // 即使 fragments 数组存在但为空，也允许直接取 content/thinking_content
                     content += rr.content;
                     emit('content', rr.content);
                 }
-                // fragments 已含 thinking 时禁止再叠加 thinking_content（修复双计数）
                 if (!gotThinkFromFragments && typeof rr.thinking_content === 'string' && rr.thinking_content) {
                     thinking += rr.thinking_content;
                     emit('thinking', rr.thinking_content);
@@ -519,7 +650,46 @@ async function completion(opts) {
                 return;
             }
 
-            // 3. 处理常规文本增量
+            // 3. 检查单字段片段类型更新 (如 {"p":"response/fragments/0/type", "v":"RESPONSE"})
+            const typeMatch = p.match(/^response\/fragments\/(-?\d+)\/type$/);
+            if (typeMatch && typeof j.v === 'string') {
+                const rawId = Number(typeMatch[1]);
+                const fid = rawId < 0 ? currentFragmentId : rawId;
+                const ty = j.v.toUpperCase();
+                const isThink = (ty === 'THINK' || ty === 'THINKING');
+                if (fid >= 0) fragmentTypes.set(fid, isThink ? 'thinking' : 'text');
+                currentType = isThink ? 'thinking' : 'text';
+                return;
+            }
+
+            // 4. 路径 → 类型映射判断
+            if (p === 'response/content') {
+                currentType = 'text';
+            } else if (p === 'response/thinking_content') {
+                currentType = 'thinking';
+            } else {
+                const fm = p.match(/^response\/fragments\/(-?\d+)\/(thinking_content|content)$/);
+                if (fm) {
+                    const rawId = Number(fm[1]);
+                    const fid = rawId < 0 ? currentFragmentId : rawId;
+                    if (/\/thinking_content$/.test(p)) {
+                        currentType = 'thinking';
+                    } else {
+                        const known = fragmentTypes.get(fid);
+                        currentType = known ? known : (thinkingEnabled && fid <= 2 ? 'thinking' : 'text');
+                    }
+                } else if (p) {
+                    // 未知或特定路径
+                    const pathSaysThink = /thinking|think/i.test(p);
+                    const pathSaysText = /(^|\/)(content|text)(_|$)/i.test(p) && !pathSaysThink;
+                    if (typeof j.v === 'string') {
+                        if (pathSaysThink) { thinking += j.v; emit('thinking', j.v); return; }
+                        else if (pathSaysText) { content += j.v; emit('content', j.v); return; }
+                    }
+                }
+            }
+
+            // 5. 处理常规文本增量 (如 {"v": "..."} 或 {"p":"response/fragments/-1/content", "v":"..."})
             let text = null;
             if (typeof j.v === 'string') text = j.v;
             if (text == null || text === '') return;
@@ -606,6 +776,15 @@ async function completion(opts) {
             if (DS_DEBUG) logger.warn(`[SSE] 收到事件但无正文/思考内容，视为有效空响应 finished=${finished} tokens=${tokens}`);
         }
 
+        // 思考链与正文兜底分离：若思考字段为空且正文中包含 <think> 标签，自动剥离归位
+        if (!thinking && content && content.includes('<think>')) {
+            const m = content.match(/<think>([\s\S]*?)<\/think>/);
+            if (m) {
+                thinking = m[1].trim();
+                content = content.replace(/<think>[\s\S]*?<\/think>/, '').trim();
+            }
+        }
+
         return { content, thinking, messageId, tokens, citations };
     } finally {
         if (stallTimer) clearTimeout(stallTimer);
@@ -621,4 +800,7 @@ module.exports = {
     completion,
     getPowHeader,
     prewarmPoW,
+    dispatcherFor,
+    resolveProxyUrl,
+    withProxy,
 };

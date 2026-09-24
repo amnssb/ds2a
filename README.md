@@ -5,6 +5,12 @@
 
 ---
 
+## 项目要求
+
+- **AI 测试时禁止传假 token 上去**：进行 AI / 联通性 / 自动化测试时，必须使用真实有效账号 Token，禁止提交、上传或注入伪造 / 占位 / 过期假 Token，避免污染 `data/accounts.json` 与线上调度池喵。
+
+---
+
 ## 核心技术特性
 
 ### 1. 异常熔断与智能故障隔离 (Circuit Breaker & Failover)
@@ -26,9 +32,19 @@
 
 ### 4. 增强型现代控制台 (Web Dashboard)
 - 访问：`http://127.0.0.1:19728/panel/`（默认凭证：`admin` / `admin123`）。
-- **账号调度中心**：支持一键连通性探测、手动暂停/恢复、自动重登、实时并发负载展示。
-- **日志审计面板**：支持按成功/失败过滤历史请求，实时查看失败堆栈与诊断信息。
-- **Token 资产大盘**：日度消耗曲线与各账号配额分析。
+- **账号调度中心**：支持一键连通性探测、手动暂停/恢复、代理配置与批量分配、实时并发负载展示喵。
+- **日志审计面板**：支持按成功/失败过滤历史请求，实时查看失败堆栈与诊断信息喵。
+- **Token 资产大盘**：日度消耗曲线与各账号配额分析喵。
+
+### 5. 账号级独立代理与代理池均分 (Per-Account Dedicated Proxy)
+- **多协议原生支持**：全面支持 `http://`、`https://`、`socks5://` 及 `socks5h://` 协议，原生支持带账号密码的代理认证喵。
+- **全链路出口 IP 彻底隔离**：每个账号配置的独立代理严格贯穿该账号的所有对话请求、PoW 挑战求解与浏览器换 Token 流程，彻底解决多账号同 IP 串流风控痛点喵。
+- **代理池一键均分绑定**：支持在控制台与 Studio 中直接粘贴多行代理列表，一键将代理轮询均分给全部账号或勾选账号，支持一键清空与单账号快速编辑喵。
+- **Docker 容器环境智能兼容**：容器内自动解析 `host.docker.internal`，填入 `127.0.0.1:7890` 的宿主机本地代理可自动重定向至宿主机网关，跨容器及公网代理亦原生直连生效喵。
+
+### 6. 本机 Studio 与服务端网关双层协同架构
+- **本机 Studio (`http://127.0.0.1:19729/`)**：在本机安全维护账号敏感凭证与代理池，利用本地 Chrome 浏览器实现稳定自动换 Token，并一键无缝推送到远端服务器喵。
+- **服务端网关 (`http://127.0.0.1:19728/`)**：轻量化生产部署，无需安装浏览器依赖，专注于高并发纯 HTTP 分发、WASM 硬件级哈希计算与异常熔断 Failover 调度喵。
 
 ---
 
@@ -42,15 +58,22 @@ ds-browserless/
 │   ├── storage.js         # 运行时数据与历史请求持久化引擎
 │   ├── pow-engine.js      # WASM 求解器 + 纯 JS 容灾兜底 + 预热池
 │   ├── account-pool.js    # 账号状态机、熔断隔离与 Failover 调度器
-│   ├── ds-client.js       # KeepAlive 原生 HTTP 客户端与 SSE 解析器
+│   ├── ds-client.js       # KeepAlive 原生 HTTP 客户端、SOCKS5 连接器与 SSE 解析器
+│   ├── ds-login.js        # Chrome / CDP 自动登录与 Token 刷新引擎
 │   ├── auth.js            # 管理员会话与 API Key 鉴权模块
 │   └── routes/
 │       ├── chat.js        # OpenAI / Claude 兼容对话端点
-│       ├── accounts.js    # 账号 CRUD 与状态测试路由
+│       ├── accounts.js    # 账号 CRUD、状态测试与 Studio 同步路由
 │       ├── stats.js       # 监控大盘与持久日志查询
 │       └── keys.js        # API Key 管理路由
+├── studio/                # 本机账号管理与换 Token 工作台
+│   ├── server.js          # Studio 服务端 (19729 端口)
+│   ├── store.js           # 本地账号存储与状态镜像
+│   ├── jobs.js            # 批量换 Token 与上行任务处理
+│   ├── remote.js          # 服务端通信与状态同步客户端
+│   └── public/index.html  # Studio 可视化界面 (支持代理均分与弹窗编辑)
 ├── data/                  # 持久化数据目录
-│   ├── accounts.json      # 账号凭据与调度状态
+│   ├── accounts.json      # 账号凭据、独立代理与调度状态
 │   ├── auth-data.json     # 管理员凭证与 API Key 数据
 │   ├── stats.json         # 累计统计数据（重启恢复）
 │   └── requests.jsonl     # 请求流水日志（追加流）
@@ -58,8 +81,8 @@ ds-browserless/
 │   ├── server.log
 │   └── server.err.log
 ├── vendor/                # 官方 sha3_wasm_bg.wasm 核心
-├── panel/                 # 响应式管理后台
-├── server.js              # 工业级应用入口
+├── panel/                 # 响应式管理后台 (含代理分配)
+├── server.js              # 网关服务端入口
 ├── manage.ps1             # Windows 综合运维管理脚本
 ├── ecosystem.config.js    # PM2 生产环境配置文件
 ├── Dockerfile             # 容器构建镜像
@@ -104,11 +127,19 @@ pm2 monit
 ### 方式三：Docker / Docker Compose
 
 ```bash
-# 一键编译与启动
-docker-compose up -d
+# 构建并后台启动网关服务（支持自动映射宿主机代理 host.docker.internal）
+docker compose up -d --build
 
-# 查看日志
-docker-compose logs -f
+# 查看运行日志与健康状态
+docker compose logs -f
+```
+
+### 方式四：本机 Studio 启动（账号管理与换 Token）
+
+```bash
+# 启动本机账号 Studio
+npm run studio
+# 随后在浏览器访问 http://127.0.0.1:19729/ 即可进行可视化管理与代理均分喵
 ```
 
 ---
@@ -144,8 +175,13 @@ curl http://127.0.0.1:19728/v1/messages \
 
 ## 常见问题排查
 
+- **Q: 如何为每个账号配置独立固定代理？**
+  - 在本机 Studio（`19729` 端口）中，可以在表格「代理 (Proxy)」列直接点击「+配代理 / 改」单独配置，也可以在顶部的「⚡ 账号分代理管理」卡片中粘贴多行代理列表一键均分绑定喵。
+  - 在服务端控制台（`19728` 端口）的「账号调度管理」中，也可点击右上角「⚡ 批量分配代理」或行内「编辑账号」进行绑定喵。
+- **Q: 容器内如何使用宿主机上的本地代理（如 Clash 7890）？**
+  - 容器环境已集成 `extra_hosts` 映射与代码级自动转换逻辑，即使在账号代理中填写 `http://127.0.0.1:7890`，网关在容器内会自动重写为 `http://host.docker.internal:7890` 访问宿主机网关，无需手动调整 IP 喵。
 - **Q: 账号显示 `🔴 异常已暂停` 如何处理？**
-  - 说明该账号的 userToken 已被官方判定失效（报 `40003 invalid token`）。
-  - 登录 [chat.deepseek.com](https://chat.deepseek.com) 控制台，按 F12 执行 `JSON.parse(localStorage.getItem('userToken')).value` 获取新 Token，在后台面板编辑更新即可立即恢复。
+  - 说明该账号的 userToken 已被官方判定失效（报 `40003 invalid token`）喵。
+  - 可以在本机 Studio 点击「批量换 Token」全自动刷新，或者在控制台编辑更新 Token 后点击「连通测试」恢复调度喵。
 - **Q: 多账号调度是如何轮询的？**
-  - 系统使用最小负载优先调度。遇到异常账号立刻自动跳过，并顺延至下一可用账号，避免单账号故障影响整体业务。
+  - 系统使用负载与健康度优先调度策略喵。遇到异常账号立刻自动隔离并无缝重试下一个健康账号，调用方无感且互不串号喵。

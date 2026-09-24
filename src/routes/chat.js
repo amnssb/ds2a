@@ -37,10 +37,6 @@ function resolveSessionKey(req, body) {
     if (h) return { key: String(h).slice(0, 100), ephemeral: false };
     if (body && body.session_id) return { key: String(body.session_id).slice(0, 100), ephemeral: false };
     if (body && body.conversation_id) return { key: 'conv:' + String(body.conversation_id).slice(0, 90), ephemeral: false };
-    if (body && body.user) {
-        const u = typeof body.user === 'string' ? body.user : (body.user.id || body.user.name);
-        if (u) return { key: String(u).slice(0, 100), ephemeral: false };
-    }
     return { key: '__eph_' + crypto.randomBytes(6).toString('hex'), ephemeral: true };
 }
 
@@ -678,9 +674,16 @@ router.post('/v1/chat/completions', async (req, res) => {
         if (!res.headersSent) {
             res.status(status).json({ error: { message: e.message, type: 'api_error' } });
         } else {
-            // 流已开：补发合法 finish_reason + [DONE]，否则 AI SDK 会报 finish reason "other"
+            // 流已开：补发错误信息正文 + 合法 finish_reason('stop') + [DONE]，彻底消除 AI SDK finish reason "other"
             try {
                 if (!res.writableEnded) {
+                    const errMsg = `[服务响应异常: ${e.message}]`;
+                    if (!oaiRoleSent) {
+                        res.write('data: ' + JSON.stringify(oaiChunk(id, { role: 'assistant', content: errMsg }, body.model)) + '\n\n');
+                        oaiRoleSent = true;
+                    } else {
+                        res.write('data: ' + JSON.stringify(oaiChunk(id, { content: '\n\n' + errMsg }, body.model)) + '\n\n');
+                    }
                     res.write('data: ' + JSON.stringify(oaiFinish(id, 'stop', body.model)) + '\n\n');
                     res.write('data: [DONE]\n\n');
                     res.end();
@@ -878,13 +881,18 @@ router.post('/v1/messages', async (req, res) => {
         if (!res.headersSent) {
             res.status(500).json({ type: 'error', error: { type: 'api_error', message: e.message } });
         } else {
-            // 流已开：关闭未完结 content block，并补 message_delta(stop_reason) + message_stop
+            // 流已开：补发错误信息文本 + 关闭未完结 content block，并补 message_delta(stop_reason) + message_stop
             try {
                 if (!res.writableEnded) {
+                    const errMsg = `[服务响应异常: ${e.message}]`;
+                    if (typeof textIdx === 'undefined' || textIdx < 0) {
+                        if (typeof textBlockIndex === 'function') textBlockIndex();
+                    }
                     if (typeof textIdx !== 'undefined' && textIdx >= 0) {
+                        res.write('event: content_block_delta\ndata: ' + JSON.stringify({ type: 'content_block_delta', index: textIdx, delta: { type: 'text_delta', text: '\n\n' + errMsg } }) + '\n\n');
                         res.write('event: content_block_stop\ndata: ' + JSON.stringify({ type: 'content_block_stop', index: textIdx }) + '\n\n');
                     }
-                    stopThinkBlock();
+                    if (typeof stopThinkBlock === 'function') stopThinkBlock();
                     res.write('event: message_delta\ndata: ' + JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 0 } }) + '\n\n');
                     res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
                     res.end();

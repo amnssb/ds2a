@@ -251,13 +251,12 @@ class AccountPool {
                 }
             }
 
-            // 负载均衡：min inflight 分组 + 组内 round-robin（修复串行请求死磕第一个账号）
-            healthyCandidates.sort((a, b) => a.inflight - b.inflight);
-            const minInflight = healthyCandidates[0].inflight;
-            const tied = healthyCandidates.filter(a => a.inflight === minInflight);
-            const start = ((this.cursor % tied.length) + tied.length) % tied.length;
-            const picked = tied[start];
-            this.cursor = (start + 1) % tied.length;
+            // 负载均衡：在途并发最少优先；同并发下最久未调用 (LRU) 优先，保证多账号完全均匀轮流调度
+            healthyCandidates.sort((a, b) => {
+                if (a.inflight !== b.inflight) return a.inflight - b.inflight;
+                return (a.lastUsedAt || 0) - (b.lastUsedAt || 0);
+            });
+            const picked = healthyCandidates[0];
             picked.inflight = Math.max(0, (picked.inflight || 0) + 1);
             picked.lastUsedAt = now;
             return picked;
@@ -274,12 +273,11 @@ class AccountPool {
                     return pref;
                 }
             }
-            atCap.sort((a, b) => a.inflight - b.inflight);
-            const minInflight = atCap[0].inflight;
-            const tied = atCap.filter(a => a.inflight === minInflight);
-            const start = ((this.cursor % tied.length) + tied.length) % tied.length;
-            const picked = tied[start];
-            this.cursor = (start + 1) % tied.length;
+            atCap.sort((a, b) => {
+                if (a.inflight !== b.inflight) return a.inflight - b.inflight;
+                return (a.lastUsedAt || 0) - (b.lastUsedAt || 0);
+            });
+            const picked = atCap[0];
             picked.inflight = Math.max(0, (picked.inflight || 0) + 1);
             picked.lastUsedAt = now;
             return picked;

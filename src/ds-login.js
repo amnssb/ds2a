@@ -41,21 +41,9 @@ const CLIENT_HEADERS = {
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 // 账号级代理：HTTP 登录出口 IP 与 completion 保持一致，降低风控
-let _LoginProxyAgent = null;
-let _LoginProxyUrl = '';
+const dsClient = require('./ds-client');
 function loginFetchOpts(proxy, opts) {
-    const url = String(proxy || config.DEFAULT_PROXY || '').trim();
-    if (!url) return opts;
-    try {
-        const { ProxyAgent } = require('undici');
-        if (!_LoginProxyAgent || _LoginProxyUrl !== url) {
-            _LoginProxyAgent = new ProxyAgent(url);
-            _LoginProxyUrl = url;
-        }
-        return Object.assign({}, opts, { dispatcher: _LoginProxyAgent });
-    } catch (e) {
-        return opts;
-    }
+    return dsClient.withProxy(proxy, opts);
 }
 
 const CHROME_CANDIDATES = [
@@ -235,6 +223,23 @@ class BrowserSession {
             port = 9701 + (h % 200);
         }
         this.port = port;
+        let rawProxy = String(o.proxy || config.DEFAULT_PROXY || '').trim();
+        this.proxy = rawProxy;
+        this.proxyArg = null;
+        this.proxyUser = '';
+        this.proxyPass = '';
+        if (rawProxy) {
+            let p = rawProxy;
+            if (!/^[a-zA-Z0-9]+:\/\//.test(p)) p = 'http://' + p;
+            try {
+                const u = new URL(p);
+                if (u.username) this.proxyUser = decodeURIComponent(u.username);
+                if (u.password) this.proxyPass = decodeURIComponent(u.password);
+                this.proxyArg = `${u.protocol}//${u.host}`;
+            } catch (e) {
+                this.proxyArg = p;
+            }
+        }
         // 有头专用 profile：避免多账号串会话拿到上一个 userToken
         this.tag = String(o.tag || (this.headless
             ? 'login'
@@ -255,6 +260,7 @@ class BrowserSession {
         fs.mkdirSync(profileDir, { recursive: true });
         const args = [
             this.headless ? '--headless=new' : null,
+            this.proxyArg ? ('--proxy-server=' + this.proxyArg) : null,
             '--remote-debugging-port=' + this.port,
             '--user-data-dir=' + profileDir,
             '--disk-cache-dir=' + path.join(profileDir, 'cache'),
@@ -277,6 +283,9 @@ class BrowserSession {
         this.sid = att.result.sessionId;
         await this.send('Page.enable', {}, this.sid);
         await this.send('Runtime.enable', {}, this.sid);
+        if (this.proxyUser && this.proxyPass) {
+            await this.send('Fetch.enable', { handleAuthRequests: true }, this.sid);
+        }
         this.alive = true;
         return this;
     }
@@ -298,6 +307,17 @@ class BrowserSession {
             this.ws.on('message', raw => {
                 let m;
                 try { m = JSON.parse(raw.toString()); } catch (e) { return; }
+                if (m.method === 'Fetch.authRequired') {
+                    this.send('Fetch.continueWithAuth', {
+                        requestId: m.params.requestId,
+                        authChallengeResponse: {
+                            response: 'ProvideCredentials',
+                            username: this.proxyUser,
+                            password: this.proxyPass,
+                        }
+                    }, this.sid).catch(() => {});
+                    return;
+                }
                 if (m.id && this.waiters.has(m.id)) { this.waiters.get(m.id)(m); this.waiters.delete(m.id); }
             });
             this.ws.once('open', res);
@@ -609,13 +629,13 @@ const STARTING = new Map();
 let IDLE_TIMER = null;
 const IDLE_MS = Number(process.env.DS_LOGIN_IDLE_S || 120) * 1000;
 
-async function sharedSession(headless, profileTag) {
-    const key = (headless ? 'h' : 'f') + ':' + (profileTag || 'default');
+async function sharedSession(headless, profileTag, proxy) {
+    const key = (headless ? 'h' : 'f') + ':' + (profileTag || 'default') + ':' + (proxy || '');
     const cur = SESSIONS.get(key);
     if (cur && cur.alive) return cur;
     if (STARTING.has(key)) return STARTING.get(key);
     const p = (async () => {
-        const s = new BrowserSession({ headless, tag: headless ? 'login' : ('login-headful-' + (profileTag || 'default')) });
+        const s = new BrowserSession({ headless, tag: headless ? 'login' : ('login-headful-' + (profileTag || 'default')), proxy });
         await s.start();
         SESSIONS.set(key, s);
         return s;
@@ -630,8 +650,8 @@ function touchShared() {
     if (IDLE_TIMER.unref) IDLE_TIMER.unref();
 }
 
-async function dropShared(headless, profileTag) {
-    const key = (headless ? 'h' : 'f') + ':' + (profileTag || 'default');
+async function dropShared(headless, profileTag, proxy) {
+    const key = (headless ? 'h' : 'f') + ':' + (profileTag || 'default') + ':' + (proxy || '');
     const s = SESSIONS.get(key);
     SESSIONS.delete(key);
     if (s) await s.close().catch(() => {});
@@ -664,7 +684,7 @@ async function loginViaBrowsers(o) {
     for (const hl of order) {
         let sess;
         try {
-            sess = await sharedSession(hl, profileTag);
+            sess = await sharedSession(hl, profileTag, o.proxy);
         } catch (e) {
             last = { ok: false, error: (hl ? '无头' : '有头') + '浏览器启动失败: ' + e.message };
             continue;
@@ -675,10 +695,10 @@ async function loginViaBrowsers(o) {
             touchShared();
             if (r.ok) return r;
             last = r;
-            if (r.waf || isRiskish(r)) await dropShared(hl, profileTag);
+            if (r.waf || isRiskish(r)) await dropShared(hl, profileTag, o.proxy);
         } catch (e) {
             last = { ok: false, error: '浏览器登录异常: ' + e.message };
-            await dropShared(hl, profileTag).catch(() => {});
+            await dropShared(hl, profileTag, o.proxy).catch(() => {});
         }
     }
     return last || { ok: false, error: '无头登录未产生结果' };

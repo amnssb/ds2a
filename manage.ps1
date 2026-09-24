@@ -78,6 +78,8 @@ function Start-Svc {
     $proc = Start-Process -FilePath 'node' `
         -ArgumentList 'server.js' `
         -WorkingDirectory $here `
+        -RedirectStandardOutput $logFile `
+        -RedirectStandardError $errFile `
         -PassThru -WindowStyle Hidden
 
     $proc.Id | Out-File -LiteralPath $pidFile -Encoding ascii -NoNewline

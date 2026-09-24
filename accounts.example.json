@@ -3,6 +3,7 @@
     "name": "acc1",
     "email": "your@email.com",
     "password": "your-password",
+    "proxy": "http://127.0.0.1:7890",
     "autoLogin": true
   },
   {
@@ -14,6 +15,6 @@
   },
   {
     "name": "acc3",
-    "token": "也可以继续手动贴 get-token.js 导出的 token（不填邮箱密码时走这条）"
+    "token": "真实有效 token（get-token.js 导出；AI 测试时禁止填假 token）"
   }
 ]

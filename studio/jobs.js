@@ -81,6 +81,7 @@ async function runTokenJob(opts) {
                     deviceId: acc.deviceId || '',
                     name: acc.name,
                     profileTag: acc.name,
+                    proxy: acc.proxy || '',
                     timeoutMs: 45000,
                     wafTimeoutMs: Number(process.env.DS_WAF_TIMEOUT_MS || 90000),
                     loginRetries: 8,
@@ -91,6 +92,7 @@ async function runTokenJob(opts) {
                         name: acc.name,
                         token: r.token,
                         deviceId: r.deviceId || acc.deviceId || '',
+                        proxy: acc.proxy || '',
                         lastLoginAt: at,
                         lastLoginError: '',
                     });
@@ -100,7 +102,7 @@ async function runTokenJob(opts) {
                 } else {
                     job.fail++;
                     const err = r.error || '登录失败';
-                    store.upsertAccount({ name: acc.name, lastLoginError: err, deviceId: r.deviceId || '' });
+                    store.upsertAccount({ name: acc.name, lastLoginError: err, deviceId: r.deviceId || '', proxy: acc.proxy || '' });
                     push('FAIL ' + acc.name + ': ' + err);
                     items.push({ name: acc.name, ok: false, error: err });
                 }
@@ -130,6 +132,7 @@ async function runTokenJob(opts) {
                     password: a.password,
                     token: a.token,
                     deviceId: a.deviceId,
+                    proxy: a.proxy || '',
                     lastLoginAt: a.lastLoginAt,
                     autoLogin: a.autoLogin !== false,
                 }));
@@ -178,6 +181,7 @@ async function runPushOnly() {
             password: a.password,
             token: a.token,
             deviceId: a.deviceId,
+            proxy: a.proxy || '',
             lastLoginAt: a.lastLoginAt,
             autoLogin: a.autoLogin !== false,
         }));

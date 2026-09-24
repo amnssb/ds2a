@@ -77,22 +77,25 @@ pm2 save
 
 ### 方式二：Docker / Docker Compose 部署
 
-适用于容器化集群、NAS 或一键部署喵。
+适用于容器化集群、Linux 云服务器或轻量 NAS 一键编排喵。
 
 #### 使用 Docker Compose（推荐）
 
-`docker-compose.yml` 已配置好数据卷挂载，持久化文件不会丢失喵。
+`docker-compose.yml` 已经内置了数据卷挂载、网络穿透与健康检查探测喵：
 
 ```bash
-# 后台构建并启动容器
-docker-compose up -d
+# 构建镜像并在后台启动服务
+docker compose up -d --build
 
-# 查看运行日志
-docker-compose logs -f
+# 实时查看运行日志
+docker compose logs -f
 
 # 停止服务
-docker-compose down
+docker compose down
 ```
+
+> [!NOTE]
+> **容器内代理穿透特性**：`docker-compose.yml` 已配置 `extra_hosts: ["host.docker.internal:host-gateway"]` 与 `DOCKER_CONTAINER=1` 环境变量喵。如果账号绑定的代理是宿主机上的本地代理（例如 `http://127.0.0.1:7890`），网关容器会自动映射至宿主机网关，避免连接拒绝喵。
 
 #### 使用原生 Docker
 
@@ -104,6 +107,8 @@ docker build -t ds2a:latest .
 docker run -d \
   --name ds-gateway \
   -p 19728:19728 \
+  --add-host=host.docker.internal:host-gateway \
+  -e DOCKER_CONTAINER=1 \
   -v $(pwd)/data:/app/data \
   -v $(pwd)/logs:/app/logs \
   --restart always \
@@ -143,23 +148,44 @@ node server.js
 
 ---
 
+### 方式四：本机 Studio 启动（批量账号管理与代理池均分）
+
+推荐在有图形界面的机器（如本地 Windows / macOS）上运行 Studio 负责账号管理与换 Token 喵：
+
+```bash
+# 启动本机账号 Studio
+npm run studio
+```
+
+在浏览器打开 `http://127.0.0.1:19729/` 即可：
+- 批量导入账号与代理列表（格式：`账号,邮箱,密码[,代理]` 或 JSON 数组）喵。
+- 粘贴多行代理列表，一键将代理轮询均分给所有账号或选定账号喵。
+- 调度本地 Chrome 自动执行有头/无头换 Token 任务喵。
+- 换完后一键「上行同步」至远端服务器网关（19728 端口），服务端自动生效喵。
+
+---
+
 ## 核心配置说明
 
 环境变量或全局配置文件位于 `src/config.js` / `.env` 喵：
 
 | 配置项 / 环境变量 | 默认值 | 说明 |
 |-------------------|--------|------|
-| `PORT` | `19728` | 网关监听端口 |
-| `HOST` | `0.0.0.0` | 网关监听 IP 地址 |
-| `DATA_DIR` | `./data` | 持久化数据存储路径 |
-| `LOG_DIR` | `./logs` | 日志轮转存储路径 |
-| `POW_PREWARM_ENABLED` | `true` | 是否启用 PoW 0ms 滚动预热池 |
-| `POW_PREWARM_CONCURRENCY` | `2` | 启动时多账号并发预热限制数 |
-| `CIRCUIT_BREAKER_FAIL_LIMIT` | `3` | 账号连续失败触发熔断降级的次数 |
+| `PORT` | `19728` | 网关监听端口喵 |
+| `HOST` | `0.0.0.0` | 网关监听 IP 地址喵 |
+| `DATA_DIR` | `./data` | 持久化数据存储路径喵 |
+| `LOG_DIR` | `./logs` | 日志轮转存储路径喵 |
+| `DEFAULT_PROXY` | `""` | 全局兜底代理（当账号未单独指定 proxy 时生效）喵 |
+| `DOCKER_CONTAINER` | `0` | `1` 标识处于容器内，自动将 127.0.0.1 代理转映射至宿主机喵 |
+| `POW_PREWARM_ENABLED` | `true` | 是否启用 PoW 0ms 滚动预热池喵 |
+| `POW_PREWARM_CONCURRENCY` | `2` | 启动时多账号并发预热限制数喵 |
+| `CIRCUIT_BREAKER_FAIL_LIMIT` | `3` | 账号连续失败触发熔断降级的次数喵 |
 
 ---
 
 ## 账号与 Token 配置
+
+> **项目要求**：AI 测试时禁止传假 token 上去喵——测试必须使用真实有效 Token，禁止写入伪造 / 占位 / 过期假 Token，严禁将虚构测试账号写入项目文档喵。
 
 ### 1. 手动配置账号 (`data/accounts.json`)
 
@@ -172,10 +198,16 @@ node server.js
     "token": "YOUR_DEEPSEEK_USER_TOKEN_HERE",
     "email": "user@example.com",
     "password": "your_password_optional",
+    "proxy": "http://127.0.0.1:7890",
     "disabled": false
   }
 ]
 ```
+
+- **`proxy` 字段说明**：
+  - 支持协议：`http://`、`https://`、`socks5://`、`socks5h://` 喵。
+  - 支持带账密格式：`http://username:password@ip:port` 或 `socks5://user:pass@ip:port` 喵。
+  - 绑定后，该账号的所有请求、PoW 计算与换 Token 将独占该出口 IP 喵。
 
 ### 2. 获取 `userToken` 方法
 

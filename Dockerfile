@@ -34,6 +34,7 @@ RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apk/re
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
 ENV PORT=19728
+ENV DOCKER_CONTAINER=1
 
 # 创建持久化数据与日志挂载目录并赋予 node 用户权限
 RUN mkdir -p /app/data /app/logs /app/vendor && chown -R node:node /app

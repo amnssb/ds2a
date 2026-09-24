@@ -52,6 +52,41 @@ app.post('/api/accounts', (req, res) => {
     res.json(r);
 });
 
+app.get('/api/accounts/:name', (req, res) => {
+    const list = store.loadAccounts();
+    const acc = list.find(a => a.name === req.params.name);
+    if (!acc) return res.status(404).json({ ok: false, error: '账号不存在' });
+    res.json({ ok: true, account: acc });
+});
+
+// 批量分配代理到账号
+app.post('/api/accounts/assign-proxies', (req, res) => {
+    const raw = String((req.body && req.body.proxies) || '').trim();
+    const proxyList = raw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    const targetNames = Array.isArray(req.body && req.body.names) ? req.body.names : null;
+    const mode = (req.body && req.body.mode) || 'roundrobin';
+    const accounts = store.loadAccounts();
+    const targets = targetNames && targetNames.length
+        ? accounts.filter(a => targetNames.includes(a.name))
+        : accounts;
+    if (!targets.length) return res.status(400).json({ ok: false, error: '没有选中的账号' });
+    let updated = 0;
+    if (mode === 'clear') {
+        for (const acc of targets) {
+            store.upsertAccount({ name: acc.name, proxy: '' });
+            updated++;
+        }
+    } else {
+        if (!proxyList.length) return res.status(400).json({ ok: false, error: '请提供至少一个代理地址' });
+        targets.forEach((acc, i) => {
+            const p = proxyList[i % proxyList.length];
+            store.upsertAccount({ name: acc.name, proxy: p });
+            updated++;
+        });
+    }
+    res.json({ ok: true, updated, total: targets.length });
+});
+
 app.delete('/api/accounts/:name', (req, res) => {
     const r = store.removeAccount(req.params.name);
     if (!r.ok) return res.status(400).json(r);
@@ -83,6 +118,7 @@ app.post('/api/accounts/import', (req, res) => {
                 name: parts[0],
                 email: parts[1] || '',
                 password: parts[2] || '',
+                proxy: parts[3] || '',
             });
             if (r.ok) added++;
             else errors.push(parts[0]);

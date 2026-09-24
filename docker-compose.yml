@@ -11,12 +11,15 @@ services:
     restart: unless-stopped
     ports:
       - "${PORT:-19728}:19728"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - .env
     environment:
       - NODE_ENV=production
       - HOST=0.0.0.0
       - PORT=19728
+      - DOCKER_CONTAINER=1
     volumes:
       # 持久化挂载：配置文件、Token 统计与历史日志保存在宿主机项目目录下
       - ./data:/app/data

@@ -54,12 +54,13 @@ function upsertAccount(patch) {
             autoLogin: true,
             disabled: false,
             deviceId: '',
+            proxy: '',
             lastLoginAt: '',
             lastLoginError: '',
         };
         list.push(item);
     }
-    for (const k of ['token', 'email', 'mobile', 'areaCode', 'password', 'deviceId', 'lastLoginAt', 'lastLoginError']) {
+    for (const k of ['token', 'email', 'mobile', 'areaCode', 'password', 'deviceId', 'proxy', 'lastLoginAt', 'lastLoginError']) {
         if (patch[k] !== undefined && patch[k] !== null) item[k] = String(patch[k]);
     }
     if (patch.autoLogin !== undefined) item.autoLogin = !!patch.autoLogin;
@@ -134,6 +135,7 @@ function mergedRows() {
             hasLocalToken: !!(a.token && a.token.length > 20 && !a.token.startsWith('{')),
             localTokenPreview: a.token ? (a.token.slice(0, 8) + '…' + a.token.slice(-4)) : '',
             deviceId: a.deviceId || '',
+            proxy: a.proxy || '',
             lastLoginAt: a.lastLoginAt || '',
             lastLoginError: a.lastLoginError || '',
             remote: s ? {

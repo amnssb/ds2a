@@ -333,8 +333,8 @@
     <h2>
       <span>账号调度池列表</span>
       <div class="flex">
+        <button class="btn primary" id="btn-batch-proxy">⚡ 批量分配代理</button>
         <button class="btn" id="btn-reload-accs">重新载入</button>
-        <button class="btn primary" id="btn-newacc">+ 添加账号 (支持粘贴 userToken)</button>
       </div>
     </h2>
     <div id="accounts-table"></div>
@@ -534,7 +534,7 @@ async function loadAccounts() {
   const accs = d.accounts || [];
 
   $('accounts-table').innerHTML = accs.length ? '<table><thead><tr>' +
-    ['账号名称','Token 凭证状态','当前调度状态','并发 / 成功 / 失败','最后一次诊断','操作'].map(h=>'<th>'+h+'</th>').join('') +
+    ['账号名称','代理 (Proxy)','Token 凭证状态','当前调度状态','并发 / 成功 / 失败','最后一次诊断','操作'].map(h=>'<th>'+h+'</th>').join('') +
     '</tr></thead><tbody>' + accs.map(a => {
       let stateTag = '<span class="tag t-ok">健康活跃</span>';
       if (a.state === 'auth_failed') stateTag = '<span class="tag t-err">Token 失效 (熔断)</span>';
@@ -543,22 +543,25 @@ async function loadAccounts() {
       else if (a.disabled) stateTag = '<span class="tag t-dim">手动停用</span>';
 
       const idAttr = `data-i="${a.index}" data-token-masked="${esc(a.token)}"`;
+      const proxyDisplay = a.proxy
+        ? `<span class="flex" style="gap:4px"><code style="font-size:11px;color:var(--accent,#4dabf7)">${esc(a.proxy)}</code><button class="btn btn-edit-acc" data-i="${a.index}" style="padding:1px 5px;font-size:10px" title="修改代理">改</button></span>`
+        : `<button class="btn btn-edit-acc" data-i="${a.index}" style="font-size:11px;padding:2px 7px;color:var(--warn)" title="为该账号配置独立代理">+配代理</button>`;
       return '<tr>' +
         `<td><b>${esc(a.name)}</b>` +
           `<div class="muted" style="font-size:11px">${esc(a.email || a.mobile || (a.hasPassword ? '已配置密码' : '仅 Token'))}</div></td>` +
+        `<td>${proxyDisplay}</td>` +
         `<td><code title="点击复制真实 Token（需登录）" class="btn-copy-token" ${idAttr} style="cursor:pointer">${esc(a.token.slice(0, 12))}…</code></td>` +
         `<td>${stateTag}</td>` +
         `<td>在途: <b>${a.inflight||0}</b> | <span style="color:var(--ok)">${a.ok||0}</span> / <span style="color:var(--err)">${a.err||0}</span></td>` +
         `<td><span style="font-size:11px;color:${a.lastError?'var(--err)':'var(--dim)'}">${esc(a.lastError || '正常运行无异常')}</span></td>` +
         `<td><div class="flex">` +
           `<button class="btn primary btn-test-acc" data-i="${a.index}">连通测试</button>` +
-          (a.hasPassword ? `<button class="btn success btn-login-acc" data-i="${a.index}">密码登录换Token</button>` : '') +
           `<button class="btn btn-tog-acc" data-i="${a.index}" data-p="${!a.paused}">${a.paused?'恢复调度':'暂停'}</button>` +
           `<button class="btn btn-edit-acc" data-i="${a.index}">编辑账号</button>` +
           `<button class="btn danger btn-del-acc" data-i="${a.index}">删除</button>` +
         `</div></td>` +
       '</tr>';
-    }).join('') + '</tbody></table>' : '<div class="empty">账号池为空，请点击上方按钮添加账号</div>';
+    }).join('') + '</tbody></table>' : '<div class="empty">账号池为空，请在 accounts.json 或 Studio 中管理账号并同步喵</div>';
 
   bindAccountEvents(accs);
 }
@@ -600,19 +603,7 @@ function bindAccountEvents(accs) {
     }
   });
 
-  document.querySelectorAll('.btn-login-acc').forEach(b => b.onclick = async () => {
-    if (!confirm('用该账号保存的邮箱/手机号 + 密码登录 DeepSeek，换取新 Token？')) return;
-    b.disabled = true;
-    b.textContent = '登录中...';
-    try {
-      const res = await api(`/api/accounts/${b.dataset.i}/login`, { method: 'POST' });
-      alert('登录成功，已更新 Token！\n' + (res.token ? res.token.slice(0, 12) + '…' : ''));
-    } catch(e) {
-      alert('登录失败: ' + e.message);
-    } finally {
-      loadAccounts();
-    }
-  });
+
 
   document.querySelectorAll('.btn-tog-acc').forEach(b => b.onclick = async () => {
     const idx = b.dataset.i;
@@ -662,25 +653,40 @@ function bindAccountEvents(accs) {
   });
 }
 
-$('btn-newacc').onclick = () => openModal('添加 DeepSeek 账号', [
-  ['账号别名', 'name', 'text', 'acc' + (document.querySelectorAll('tr').length)],
-  ['邮箱 (可选，用于密码自动登录)', 'email', 'text', ''],
-  ['手机号 (可选，与邮箱二选一)', 'mobile', 'text', ''],
-  ['区号 (手机号区号)', 'areaCode', 'text', '+86'],
-  ['登录密码 (可选，用于自动换 Token)', 'password', 'password', ''],
-  ['代理 (可选，该账号固定出口 IP；如 http://user:pass@host:port)', 'proxy', 'text', ''],
-  ['userToken (在 chat.deepseek.com 开发者工具 Application -> LocalStorage 复制 userToken.value；可与密码二选一)', 'token', 'textarea', ''],
-], async val => {
-  if (val && val.proxy !== undefined) val.proxy = String(val.proxy || '').trim();
-  await api('/api/accounts', { method: 'POST', body: JSON.stringify(val) });
-  loadAccounts();
-});
+
 $('btn-reload-accs').onclick = async () => {
   try {
     await api('/api/accounts/reload', { method: 'POST' });
     loadAccounts();
   } catch(e) { alert('重新载入失败: ' + e.message); }
 };
+
+const batchProxyBtn = $('btn-batch-proxy');
+if (batchProxyBtn) {
+  batchProxyBtn.onclick = async () => {
+    let d;
+    try { d = await api('/api/accounts'); } catch(e) { return alert('获取账号失败: ' + e.message); }
+    const accs = d.accounts || [];
+    if (!accs.length) return alert('当前没有账号可分配代理');
+    openModal('⚡ 批量分配账号代理池（每行一个）', [
+      ['代理列表（支持 HTTP/HTTPS/SOCKS5，每行一个）', 'proxies', 'textarea', 'http://127.0.0.1:7890\nsocks5://127.0.0.1:10808'],
+    ], async val => {
+      const lines = String(val.proxies || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+      if (!lines.length) throw new Error('请至少填入一个代理地址');
+      let updated = 0;
+      for (let i = 0; i < accs.length; i++) {
+        const proxy = lines[i % lines.length];
+        await api('/api/accounts/' + accs[i].index, {
+          method: 'PATCH',
+          body: JSON.stringify({ proxy })
+        });
+        updated++;
+      }
+      alert('成功为 ' + updated + ' 个账号轮询分配独立代理！');
+      loadAccounts();
+    });
+  };
+}
 
 // 3. API Key 管理
 async function loadKeys() {

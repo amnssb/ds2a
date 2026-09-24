@@ -69,6 +69,20 @@
   .cfg label { display:block; color:var(--dim); font-size:12px; margin:8px 0 4px; }
   .cfg input { width:100%; }
   #conn { font-size:12px; }
+  .modal-mask {
+    position:fixed; top:0; left:0; width:100%; height:100%;
+    background:rgba(0,0,0,0.65); z-index:100; display:flex;
+    align-items:center; justify-content:center;
+  }
+  .modal {
+    background:var(--panel); border:1px solid var(--line);
+    border-radius:12px; padding:20px; width:90%; max-width:520px;
+    box-shadow:0 20px 40px rgba(0,0,0,0.6);
+  }
+  .modal h3 { margin:0 0 16px; font-size:15px; font-weight:600; }
+  .field { margin-bottom:12px; }
+  .field label { display:block; font-size:12px; color:var(--dim); margin-bottom:5px; }
+  .field input, .field textarea { width:100%; }
 </style>
 </head>
 <body>
@@ -110,17 +124,34 @@
     </div>
   </div>
 
+  <div class="card" style="border-left:4px solid var(--accent);margin-bottom:14px">
+    <h2>⚡ 账号分代理管理与均分绑定（每账号独立固定代理 IP）</h2>
+    <div style="display:grid;grid-template-columns:1fr auto;gap:12px;align-items:start">
+      <div>
+        <textarea id="proxyPoolText" style="min-height:68px" placeholder="每行填入一个代理地址（HTTP/HTTPS/SOCKS5，支持带账密）：&#10;http://127.0.0.1:7890&#10;http://user:pass@112.33.44.55:8080&#10;socks5://127.0.0.1:10808"></textarea>
+        <div class="muted" style="margin-top:4px;font-size:11.5px">
+          💡 支持均分轮询分配到所有账号或顺序绑定到已勾选账号。每账号固定出口 IP，防止同 IP 多账号串号风控喵。
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <button id="btnAssignAllProxies" class="primary" style="white-space:nowrap">均分绑定到所有账号</button>
+        <button id="btnAssignSelProxies" style="white-space:nowrap">绑定到勾选账号</button>
+        <button id="btnClearProxies" class="danger" style="white-space:nowrap">清空所选代理</button>
+      </div>
+    </div>
+  </div>
+
   <div class="grid2">
     <div class="card">
-      <h2>批量导入（每行: name,email,password）</h2>
-      <textarea id="importText" placeholder="acc10,user@x.com,pass123&#10;acc11,user2@x.com,pass456"></textarea>
+      <h2>批量导入（每行: name,email,password[,proxy]）</h2>
+      <textarea id="importText" placeholder="acc10,user@x.com,pass123,http://127.0.0.1:7890&#10;acc11,user2@x.com,pass456,socks5://127.0.0.1:10808"></textarea>
       <div class="row" style="margin-top:8px">
         <button id="btnImport" class="primary">导入 / 更新</button>
         <span class="muted">也支持 JSON 数组</span>
       </div>
     </div>
     <div class="card">
-      <h2>任务选项</h2>
+      <h2>任务选项与控制</h2>
       <div class="row">
         <label><input type="checkbox" id="optHeadful"> 有头浏览器（默认无头）</label>
         <label><input type="checkbox" id="optPushAfter" checked> 换完自动上行</label>
@@ -140,6 +171,7 @@
           <th style="width:36px"><input type="checkbox" id="chkAll"></th>
           <th>账号</th>
           <th>邮箱</th>
+          <th>代理 (Proxy)</th>
           <th>本地 Token</th>
           <th>服务端状态</th>
           <th>禁用(权威)</th>
@@ -151,6 +183,40 @@
       </thead>
       <tbody id="tbody"></tbody>
     </table>
+  </div>
+  <div id="editModal" class="modal-mask" style="display:none">
+    <div class="modal">
+      <h3 id="modalTitle">编辑账号</h3>
+      <div class="field">
+        <label>账号名称 (不可修改)</label>
+        <input id="editName" readonly style="opacity:0.8;background:var(--bg)">
+      </div>
+      <div class="field">
+        <label>邮箱 (自动登录用，可空)</label>
+        <input id="editEmail" placeholder="user@outlook.com">
+      </div>
+      <div class="field">
+        <label>手机号 (自动登录用，可空)</label>
+        <input id="editMobile" placeholder="13800000000">
+      </div>
+      <div class="field">
+        <label>登录密码 (自动登录/换 Token 用，留空不改)</label>
+        <input id="editPassword" type="password" placeholder="留空不修改">
+      </div>
+      <div class="field">
+        <label><b style="color:var(--accent,#3b82f6)">独立代理 (Proxy)</b> — 支持 HTTP / HTTPS / SOCKS5</label>
+        <input id="editProxy" placeholder="http://127.0.0.1:7890 或 socks5://user:pass@127.0.0.1:10808">
+        <div class="muted" style="font-size:11px;margin-top:3px">填入独立代理后，该账号所有对话请求、PoW 求解与换 Token 将独占该出口 IP 喵</div>
+      </div>
+      <div class="field">
+        <label>userToken (可直接粘贴 Token，留空不改)</label>
+        <textarea id="editToken" style="min-height:50px" placeholder="留空不修改"></textarea>
+      </div>
+      <div class="row" style="justify-content:flex-end;margin-top:14px">
+        <button id="btnCancelEdit">取消</button>
+        <button id="btnSaveEdit" class="primary">保存修改</button>
+      </div>
+    </div>
   </div>
 </main>
 
@@ -183,16 +249,21 @@ function stateBadge(r) {
 function render() {
   const tb = $('#tbody');
   if (!rows.length) {
-    tb.innerHTML = '<tr><td colspan="10" class="muted" style="padding:20px;text-align:center">暂无本地账号，请先导入喵</td></tr>';
+    tb.innerHTML = '<tr><td colspan="11" class="muted" style="padding:20px;text-align:center">暂无本地账号，请先导入喵</td></tr>';
     return;
   }
   tb.innerHTML = rows.map((r, i) => {
     const rem = r.remote;
     const dis = rem ? rem.disabled : false;
+    const proxyCell = r.proxy
+      ? '<span style="display:inline-flex;align-items:center;gap:4px"><code style="font-size:11px;color:var(--accent,#4dabf7)">' + escapeHtml(r.proxy) + '</code><button data-act="edit" data-name="' + escapeHtml(r.name) + '" style="padding:1px 5px;font-size:11px" title="修改代理">改</button></span>'
+      : '<button data-act="edit" data-name="' + escapeHtml(r.name) + '" class="badge warn" style="cursor:pointer;padding:2px 7px;border:none;font-size:11px" title="设置该账号独立代理">+配代理</button>';
+
     return '<tr data-name="' + escapeHtml(r.name) + '">' +
       '<td><input type="checkbox" class="chk" data-name="' + escapeHtml(r.name) + '"></td>' +
       '<td><b>' + escapeHtml(r.name) + '</b></td>' +
       '<td class="muted">' + escapeHtml(r.email || r.mobile || '-') + '</td>' +
+      '<td>' + proxyCell + '</td>' +
       '<td>' + (r.hasLocalToken ? badge(r.localTokenPreview, 'ok') : badge('无', 'off')) +
         (r.lastLoginAt ? '<div class="muted" style="font-size:11px">' + escapeHtml(r.lastLoginAt.slice(0,19).replace('T',' ')) + '</div>' : '') +
       '</td>' +
@@ -206,6 +277,7 @@ function render() {
         escapeHtml((rem && rem.lastError) || r.lastLoginError || '') + '">' +
         escapeHtml((rem && rem.lastError) || r.lastLoginError || '-') + '</td>' +
       '<td class="row" style="gap:6px">' +
+        '<button data-act="edit" data-name="' + escapeHtml(r.name) + '" class="primary" style="padding:4px 8px">编辑</button>' +
         '<button data-act="dis" data-name="' + escapeHtml(r.name) + '" data-v="1"' + (dis?' disabled':'') + '>禁用</button>' +
         '<button data-act="dis" data-name="' + escapeHtml(r.name) + '" data-v="0"' + (dis?'':' disabled')+'>启用</button>' +
         '<button data-act="del" data-name="' + escapeHtml(r.name) + '">删</button>' +
@@ -382,12 +454,93 @@ $('#btnPull').onclick = async () => {
   } catch (e) { alert(e.message); }
 };
 
+// 代理批量分配
+$('#btnAssignAllProxies').onclick = async () => {
+  const proxies = $('#proxyPoolText').value.trim();
+  if (!proxies) return alert('请先在上方输入代理列表（每行一个，如 http://127.0.0.1:7890）');
+  try {
+    const res = await api('/api/accounts/assign-proxies', {
+      method: 'POST',
+      body: JSON.stringify({ proxies, mode: 'roundrobin' })
+    });
+    logLine('⚡ 均分代理成功: 已更新 ' + res.updated + ' / ' + res.total + ' 个账号');
+    await loadRows();
+    if ($('#optPushAfter').checked) $('#btnPush').click();
+  } catch (e) { alert(e.message); }
+};
+
+$('#btnAssignSelProxies').onclick = async () => {
+  const proxies = $('#proxyPoolText').value.trim();
+  if (!proxies) return alert('请先输入代理列表');
+  const names = [...document.querySelectorAll('.chk:checked')].map(c => c.dataset.name);
+  if (!names.length) return alert('请先勾选需要分配代理的账号');
+  try {
+    const res = await api('/api/accounts/assign-proxies', {
+      method: 'POST',
+      body: JSON.stringify({ proxies, names, mode: 'roundrobin' })
+    });
+    logLine('⚡ 勾选账号绑定代理成功: 已更新 ' + res.updated + ' 个账号');
+    await loadRows();
+    if ($('#optPushAfter').checked) $('#btnPush').click();
+  } catch (e) { alert(e.message); }
+};
+
+$('#btnClearProxies').onclick = async () => {
+  const names = [...document.querySelectorAll('.chk:checked')].map(c => c.dataset.name);
+  const targetDesc = names.length ? ('勾选的 ' + names.length + ' 个账号') : '所有账号';
+  if (!confirm('确定清空 ' + targetDesc + ' 的代理设置？')) return;
+  try {
+    const res = await api('/api/accounts/assign-proxies', {
+      method: 'POST',
+      body: JSON.stringify({ names: names.length ? names : null, mode: 'clear' })
+    });
+    logLine('已清空 ' + res.updated + ' 个账号的代理');
+    await loadRows();
+    if ($('#optPushAfter').checked) $('#btnPush').click();
+  } catch (e) { alert(e.message); }
+};
+
+// 账号单项编辑弹窗
+$('#btnCancelEdit').onclick = () => {
+  $('#editModal').style.display = 'none';
+};
+
+$('#btnSaveEdit').onclick = async () => {
+  const name = $('#editName').value.trim();
+  if (!name) return;
+  const patch = {
+    name,
+    email: $('#editEmail').value.trim(),
+    mobile: $('#editMobile').value.trim(),
+    proxy: $('#editProxy').value.trim(),
+  };
+  if ($('#editPassword').value) patch.password = $('#editPassword').value;
+  if ($('#editToken').value.trim()) patch.token = $('#editToken').value.trim();
+  try {
+    await api('/api/accounts', { method: 'POST', body: JSON.stringify(patch) });
+    $('#editModal').style.display = 'none';
+    logLine('已保存账号 ' + name + (patch.proxy ? (' · 独立代理: ' + patch.proxy) : ' · 代理已清空'));
+    await loadRows();
+    if ($('#optPushAfter').checked) $('#btnPush').click();
+  } catch (e) { alert('保存失败: ' + e.message); }
+};
+
 $('#tbody').addEventListener('click', async (e) => {
   const btn = e.target.closest('button[data-act]');
   if (!btn) return;
   const name = btn.dataset.name;
   try {
-    if (btn.dataset.act === 'del') {
+    if (btn.dataset.act === 'edit') {
+      const row = rows.find(x => x.name === name) || {};
+      $('#modalTitle').textContent = '编辑账号: ' + name;
+      $('#editName').value = name;
+      $('#editEmail').value = row.email || '';
+      $('#editMobile').value = row.mobile || '';
+      $('#editPassword').value = '';
+      $('#editProxy').value = row.proxy || '';
+      $('#editToken').value = '';
+      $('#editModal').style.display = 'flex';
+    } else if (btn.dataset.act === 'del') {
       if (!confirm('删除本地账号 ' + name + ' ?')) return;
       await api('/api/accounts/' + encodeURIComponent(name), { method: 'DELETE' });
       await loadRows();
