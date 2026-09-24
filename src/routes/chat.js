@@ -48,9 +48,41 @@ function estimateTokens(text) {
     if (!text) return 0;
     let cjk = 0, other = 0;
     for (const ch of String(text)) {
-        if (/[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(ch)) cjk++; else other++;
+        if (/[㐀-鿿぀-ヿ가-힯]/.test(ch)) cjk++; else other++;
     }
     return Math.ceil(cjk + other / 4);
+}
+
+/** 估算入站请求的 prompt token（供 Claude message_start 提前回传） */
+function estimateRequestInputTokens(body) {
+    if (!body) return 0;
+    let n = estimateTokens(contentToText(body.system || ''));
+    const msgs = body.messages || [];
+    if (Array.isArray(msgs)) {
+        for (const m of msgs) n += estimateTokens(contentToText(m && m.content));
+    }
+    return n;
+}
+
+/**
+ * 统一用量计算：
+ * - 上游 accumulated_token_usage 为权威总数（已含 thinking 输出）
+ * - 先从总数中扣除 thinking 估算值，避免 60/40 拆分后再叠加 thinking 造成重复计数
+ * - 无上游总数时回退为字符启发式估算
+ */
+function computeUsage(r, fallbackContent, fallbackThinking) {
+    const tTokens = estimateTokens(fallbackThinking || r.thinking || '');
+    if (r.tokens && r.tokens > 0) {
+        const total = Math.max(0, Math.round(r.tokens));
+        const t = Math.min(tTokens, total);
+        const rest = total - t;
+        const p = Math.round(rest * 0.6);
+        const c = rest - p;
+        return { pTokens: p, cTokens: c, tTokens: t, totalTokens: total };
+    }
+    const pTokens = estimateTokens(r.prompt);
+    const cTokens = estimateTokens(fallbackContent || '');
+    return { pTokens, cTokens, tTokens, totalTokens: pTokens + cTokens + tTokens };
 }
 
 function contentToText(c) {
@@ -498,9 +530,7 @@ router.post('/v1/chat/completions', async (req, res) => {
         const parsed = (r.hasTools || hasTools) ? parseToolCalls(rawContent) : { content: rawContent, toolCalls: [] };
         const finish = parsed.toolCalls.length ? 'tool_calls' : 'stop';
 
-        const pTokens = r.tokens ? Math.round(r.tokens * 0.6) : estimateTokens(r.prompt);
-        const cTokens = r.tokens ? Math.round(r.tokens * 0.4) : estimateTokens(rawContent);
-        const tTokens = estimateTokens(r.thinking || thinking);
+        const { pTokens, cTokens, tTokens, totalTokens } = computeUsage(r, rawContent, thinking);
 
         // 记录用量与请求日志
         storage.record({
@@ -533,12 +563,29 @@ router.post('/v1/chat/completions', async (req, res) => {
             thinkingTokens: tTokens,
         });
 
+        // OpenAI 官方语义：completion 含 reasoning，total = prompt + completion
+        const clientUsage = {
+            prompt_tokens: pTokens,
+            completion_tokens: cTokens + tTokens,
+            total_tokens: totalTokens,
+            completion_tokens_details: { reasoning_tokens: tTokens },
+        };
+
         if (stream) {
             for (let i = 0; i < parsed.toolCalls.length; i++) {
                 const tc = parsed.toolCalls[i];
                 res.write('data: ' + JSON.stringify(oaiChunk(id, { tool_calls: [{ index: i, id: tc.id, type: 'function', function: { name: tc.function.name, arguments: tc.function.arguments } }] })) + '\n\n');
             }
             res.write('data: ' + JSON.stringify(oaiFinish(id, finish)) + '\n\n');
+            // 流式末尾回传 usage（finish 后、[DONE] 前，choices 为空，兼容 stream_options.include_usage 与不带该选项的客户端）
+            res.write('data: ' + JSON.stringify({
+                id,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: body.model || 'deepseek-v4.1-flash',
+                choices: [],
+                usage: clientUsage,
+            }) + '\n\n');
             res.write('data: [DONE]\n\n');
             res.end();
         } else {
@@ -552,11 +599,7 @@ router.post('/v1/chat/completions', async (req, res) => {
                 created: Math.floor(Date.now() / 1000),
                 model: body.model || 'deepseek-v4.1-flash',
                 choices: [{ index: 0, message: msg, finish_reason: finish }],
-                usage: {
-                    prompt_tokens: pTokens,
-                    completion_tokens: cTokens,
-                    total_tokens: pTokens + cTokens,
-                },
+                usage: clientUsage,
             });
         }
 
@@ -614,7 +657,9 @@ router.post('/v1/messages', async (req, res) => {
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
         if (res.flushHeaders) res.flushHeaders();
-        res.write('event: message_start\ndata: ' + JSON.stringify({ type: 'message_start', message: { id, type: 'message', role: 'assistant', model: body.model || 'deepseek-v4.1-flash', content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } } }) + '\n\n');
+        // 先按请求内容估算 input_tokens，避免 message_start 恒为 0 导致客户端无法统计入站用量喵
+        const estInput = estimateRequestInputTokens(body);
+        res.write('event: message_start\ndata: ' + JSON.stringify({ type: 'message_start', message: { id, type: 'message', role: 'assistant', model: body.model || 'deepseek-v4.1-flash', content: [], stop_reason: null, usage: { input_tokens: estInput, output_tokens: 0 } } }) + '\n\n');
     }
 
     let content = '', thinking = '';
@@ -655,8 +700,8 @@ router.post('/v1/messages', async (req, res) => {
         const parsed = (r.hasTools || hasTools) ? parseToolCalls(rawContent) : { content: rawContent, toolCalls: [] };
         const finish = parsed.toolCalls.length ? 'tool_use' : 'end_turn';
 
-        const pTokens = r.tokens ? Math.round(r.tokens * 0.6) : estimateTokens(r.prompt);
-        const cTokens = r.tokens ? Math.round(r.tokens * 0.4) : estimateTokens(rawContent);
+        const { pTokens, cTokens, tTokens } = computeUsage(r, rawContent, thinking);
+        const outTokens = cTokens + tTokens;
 
         storage.record({
             id,
@@ -671,6 +716,7 @@ router.post('/v1/messages', async (req, res) => {
             keyName: keyInfo.name,
             promptTokens: pTokens,
             completionTokens: cTokens,
+            thinkingTokens: tTokens,
         });
 
         auth.recordUsage({
@@ -679,11 +725,12 @@ router.post('/v1/messages', async (req, res) => {
             ok: true,
             promptTokens: pTokens,
             completionTokens: cTokens,
+            thinkingTokens: tTokens,
         });
 
         if (stream) {
             res.write('event: content_block_stop\ndata: ' + JSON.stringify({ type: 'content_block_stop', index: 0 }) + '\n\n');
-            res.write('event: message_delta\ndata: ' + JSON.stringify({ type: 'message_delta', delta: { stop_reason: finish }, usage: { output_tokens: cTokens } }) + '\n\n');
+            res.write('event: message_delta\ndata: ' + JSON.stringify({ type: 'message_delta', delta: { stop_reason: finish }, usage: { output_tokens: outTokens } }) + '\n\n');
             res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
             res.end();
         } else {
@@ -706,11 +753,32 @@ router.post('/v1/messages', async (req, res) => {
                 model: body.model || 'deepseek-v4.1-flash',
                 content: blocks,
                 stop_reason: finish,
-                usage: { input_tokens: pTokens, output_tokens: cTokens },
+                usage: { input_tokens: pTokens, output_tokens: outTokens },
             });
         }
     } catch (e) {
         logger.err('v1/messages 失败: ' + e.message);
+
+        // 与 OpenAI 端点对齐：失败请求同样入账，避免 Claude 失败调用在统计中完全丢失喵
+        storage.record({
+            id,
+            at: t0,
+            endpoint: '/v1/messages',
+            model: body.model || 'deepseek-v4.1-flash',
+            ok: false,
+            status: (e.statusCode && e.statusCode >= 400 && e.statusCode < 600) ? e.statusCode : 500,
+            ms: Date.now() - t0,
+            stream,
+            error: e.message,
+            keyName: keyInfo.name,
+        });
+
+        auth.recordUsage({
+            keyId: keyInfo.keyId,
+            account: 'failed',
+            ok: false,
+        });
+
         if (!res.headersSent) {
             res.status(500).json({ type: 'error', error: { type: 'api_error', message: e.message } });
         } else {

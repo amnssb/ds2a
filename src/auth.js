@@ -299,7 +299,8 @@ function recordUsage(info) {
     if (!d.stats.byDay[dk]) d.stats.byDay[dk] = { requests: 0, promptTokens: 0, completionTokens: 0, thinkingTokens: 0, ok: 0, err: 0 };
     bump(d.stats.byDay[dk]);
 
-    if (Date.now() - (recordUsage._last || 0) > 3000) {
+    // 1s 粒度落盘，降低硬杀进程时的用量丢失窗口
+    if (Date.now() - (recordUsage._last || 0) > 1000) {
         recordUsage._last = Date.now();
         try { persist(); } catch (e) {
             console.error('[auth] 用量落盘失败:', e.message);

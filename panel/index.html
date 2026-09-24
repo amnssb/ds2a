@@ -909,7 +909,7 @@ async function loadLogs() {
         <td>${esc(q.model||'deepseek')}</td>
         <td>${fmtMs(q.ms)}</td>
         <td><span class="tag ${q.ok ? 't-ok' : 't-err'}">${q.status || (q.ok?'200':'ERR')}</span></td>
-        <td>${fmtNum((q.promptTokens||0)+(q.completionTokens||0)+(q.thinkingTokens||0))}</td>
+        <td>${fmtNum((q.tokens&&q.tokens.prompt||q.promptTokens||0)+(q.tokens&&q.tokens.completion||q.completionTokens||0)+(q.tokens&&q.tokens.thinking||q.thinkingTokens||0))}</td>
         <td><b>${esc(q.account||'-')}</b></td>
         <td class="muted">${esc(q.keyName||'-')}</td>
         <td><span style="font-size:11px;color:${q.error?'var(--err)':'var(--dim)'}">${esc(q.error||'OK')}</span></td>

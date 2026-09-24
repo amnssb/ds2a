@@ -169,7 +169,7 @@ class PersistentStorage {
         // 按日统计
         const dk = this.dayKey(at);
         if (!this.lifetime.byDay[dk]) {
-            this.lifetime.byDay[dk] = { requests: 0, ok: 0, err: 0, tokens: 0, promptTokens: 0, completionTokens: 0 };
+            this.lifetime.byDay[dk] = { requests: 0, ok: 0, err: 0, tokens: 0, promptTokens: 0, completionTokens: 0, thinkingTokens: 0 };
         }
         const day = this.lifetime.byDay[dk];
         day.requests++;
@@ -177,6 +177,7 @@ class PersistentStorage {
         day.tokens += item.tokens.total;
         day.promptTokens += item.tokens.prompt;
         day.completionTokens += item.tokens.completion;
+        day.thinkingTokens = (day.thinkingTokens || 0) + item.tokens.thinking;
 
         // 按账号统计
         const acc = item.account;
