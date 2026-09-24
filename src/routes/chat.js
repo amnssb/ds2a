@@ -569,36 +569,40 @@ router.post('/v1/chat/completions', async (req, res) => {
 
         const { pTokens, cTokens, tTokens, totalTokens } = computeUsage(r, rawContent, thinking);
 
-        // 记录用量与请求日志
-        storage.record({
-            id,
-            at: t0,
-            endpoint: '/v1/chat/completions',
-            model: body.model || 'deepseek-v4.1-flash',
-            ok: true,
-            status: 200,
-            ms: Date.now() - t0,
-            stream,
-            tools: r.hasTools,
-            thinking: r.thinkingEnabled,
-            search: r.search,
-            account: r.accountName,
-            keyName: keyInfo.name,
-            session: sess.ephemeral ? '(一次性)' : sess.key,
-            ephemeral: sess.ephemeral,
-            promptTokens: pTokens,
-            completionTokens: cTokens,
-            thinkingTokens: tTokens,
-        });
+        // 记录用量与请求日志（失败不影响已开流的收尾帧）
+        try {
+            storage.record({
+                id,
+                at: t0,
+                endpoint: '/v1/chat/completions',
+                model: body.model || 'deepseek-v4.1-flash',
+                ok: true,
+                status: 200,
+                ms: Date.now() - t0,
+                stream,
+                tools: r.hasTools,
+                thinking: r.thinkingEnabled,
+                search: r.search,
+                account: r.accountName,
+                keyName: keyInfo.name,
+                session: sess.ephemeral ? '(一次性)' : sess.key,
+                ephemeral: sess.ephemeral,
+                promptTokens: pTokens,
+                completionTokens: cTokens,
+                thinkingTokens: tTokens,
+            });
 
-        auth.recordUsage({
-            keyId: keyInfo.keyId,
-            account: r.accountName,
-            ok: true,
-            promptTokens: pTokens,
-            completionTokens: cTokens,
-            thinkingTokens: tTokens,
-        });
+            auth.recordUsage({
+                keyId: keyInfo.keyId,
+                account: r.accountName,
+                ok: true,
+                promptTokens: pTokens,
+                completionTokens: cTokens,
+                thinkingTokens: tTokens,
+            });
+        } catch (recErr) {
+            logger.err('chat 记录用量失败: ' + recErr.message);
+        }
 
         // OpenAI 官方语义：completion 含 reasoning，total = prompt + completion
         const clientUsage = {
@@ -613,16 +617,20 @@ router.post('/v1/chat/completions', async (req, res) => {
                 const tc = parsed.toolCalls[i];
                 res.write('data: ' + JSON.stringify(oaiChunk(id, { tool_calls: [{ index: i, id: tc.id, type: 'function', function: { name: tc.function.name, arguments: tc.function.arguments } }] }, body.model)) + '\n\n');
             }
+            // 必须先发带合法 finish_reason 的终止块，否则 AI SDK 等客户端会报 finish reason "other"
             res.write('data: ' + JSON.stringify(oaiFinish(id, finish, body.model)) + '\n\n');
-            // 流式末尾回传 usage（finish 后、[DONE] 前，choices 为空，兼容 stream_options.include_usage 与不带该选项的客户端）
-            res.write('data: ' + JSON.stringify({
-                id,
-                object: 'chat.completion.chunk',
-                created: Math.floor(Date.now() / 1000),
-                model: body.model || 'deepseek-v4.1-flash',
-                choices: [],
-                usage: clientUsage,
-            }) + '\n\n');
+            // 仅在客户端声明 stream_options.include_usage 时回传空 choices + usage（与 OpenAI 一致，避免严格客户端被空 choices 扰乱）
+            const wantUsage = !!(body.stream_options && body.stream_options.include_usage);
+            if (wantUsage) {
+                res.write('data: ' + JSON.stringify({
+                    id,
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: body.model || 'deepseek-v4.1-flash',
+                    choices: [],
+                    usage: clientUsage,
+                }) + '\n\n');
+            }
             res.write('data: [DONE]\n\n');
             res.end();
         } else {
@@ -644,32 +652,39 @@ router.post('/v1/chat/completions', async (req, res) => {
     } catch (e) {
         logger.err('chat/completions 失败: ' + e.message);
 
-        storage.record({
-            id,
-            at: t0,
-            endpoint: '/v1/chat/completions',
-            model: body.model || 'deepseek-v4.1-flash',
-            ok: false,
-            status: (e.statusCode && e.statusCode >= 400 && e.statusCode < 600) ? e.statusCode : 500,
-            ms: Date.now() - t0,
-            stream,
-            error: e.message,
-            keyName: keyInfo.name,
-        });
-
-        auth.recordUsage({
-            keyId: keyInfo.keyId,
-            account: 'failed',
-            ok: false,
-        });
-
         const status = (e.statusCode && e.statusCode >= 400 && e.statusCode < 600 && e.statusCode !== 499) ? e.statusCode : 500;
+        // 统计入账失败不阻断错误响应
+        try {
+            storage.record({
+                id,
+                at: t0,
+                endpoint: '/v1/chat/completions',
+                model: body.model || 'deepseek-v4.1-flash',
+                ok: false,
+                status,
+                ms: Date.now() - t0,
+                stream,
+                error: e.message,
+                keyName: keyInfo.name,
+            });
+
+            auth.recordUsage({
+                keyId: keyInfo.keyId,
+                account: 'failed',
+                ok: false,
+            });
+        } catch (recErr) {}
+
         if (!res.headersSent) {
             res.status(status).json({ error: { message: e.message, type: 'api_error' } });
         } else {
+            // 流已开：补发合法 finish_reason + [DONE]，否则 AI SDK 会报 finish reason "other"
             try {
-                res.write('data: ' + JSON.stringify({ error: { message: e.message } }) + '\n\n');
-                res.end();
+                if (!res.writableEnded) {
+                    res.write('data: ' + JSON.stringify(oaiFinish(id, 'stop', body.model)) + '\n\n');
+                    res.write('data: [DONE]\n\n');
+                    res.end();
+                }
             } catch (e2) {}
         }
     }
@@ -770,30 +785,34 @@ router.post('/v1/messages', async (req, res) => {
         const { pTokens, cTokens, tTokens } = computeUsage(r, rawContent, thinking);
         const outTokens = cTokens + tTokens;
 
-        storage.record({
-            id,
-            at: t0,
-            endpoint: '/v1/messages',
-            model: body.model || 'deepseek-v4.1-flash',
-            ok: true,
-            status: 200,
-            ms: Date.now() - t0,
-            stream,
-            account: r.accountName,
-            keyName: keyInfo.name,
-            promptTokens: pTokens,
-            completionTokens: cTokens,
-            thinkingTokens: tTokens,
-        });
+        try {
+            storage.record({
+                id,
+                at: t0,
+                endpoint: '/v1/messages',
+                model: body.model || 'deepseek-v4.1-flash',
+                ok: true,
+                status: 200,
+                ms: Date.now() - t0,
+                stream,
+                account: r.accountName,
+                keyName: keyInfo.name,
+                promptTokens: pTokens,
+                completionTokens: cTokens,
+                thinkingTokens: tTokens,
+            });
 
-        auth.recordUsage({
-            keyId: keyInfo.keyId,
-            account: r.accountName,
-            ok: true,
-            promptTokens: pTokens,
-            completionTokens: cTokens,
-            thinkingTokens: tTokens,
-        });
+            auth.recordUsage({
+                keyId: keyInfo.keyId,
+                account: r.accountName,
+                ok: true,
+                promptTokens: pTokens,
+                completionTokens: cTokens,
+                thinkingTokens: tTokens,
+            });
+        } catch (recErr) {
+            logger.err('messages 记录用量失败: ' + recErr.message);
+        }
 
         if (stream) {
             // 收尾：先 stop 仍在打开的 text，再 stop 尚未关闭的 thinking
@@ -834,31 +853,42 @@ router.post('/v1/messages', async (req, res) => {
         logger.err('v1/messages 失败: ' + e.message);
 
         // 与 OpenAI 端点对齐：失败请求同样入账，避免 Claude 失败调用在统计中完全丢失喵
-        storage.record({
-            id,
-            at: t0,
-            endpoint: '/v1/messages',
-            model: body.model || 'deepseek-v4.1-flash',
-            ok: false,
-            status: (e.statusCode && e.statusCode >= 400 && e.statusCode < 600) ? e.statusCode : 500,
-            ms: Date.now() - t0,
-            stream,
-            error: e.message,
-            keyName: keyInfo.name,
-        });
+        // 统计入账失败不阻断收尾
+        try {
+            storage.record({
+                id,
+                at: t0,
+                endpoint: '/v1/messages',
+                model: body.model || 'deepseek-v4.1-flash',
+                ok: false,
+                status: (e.statusCode && e.statusCode >= 400 && e.statusCode < 600) ? e.statusCode : 500,
+                ms: Date.now() - t0,
+                stream,
+                error: e.message,
+                keyName: keyInfo.name,
+            });
 
-        auth.recordUsage({
-            keyId: keyInfo.keyId,
-            account: 'failed',
-            ok: false,
-        });
+            auth.recordUsage({
+                keyId: keyInfo.keyId,
+                account: 'failed',
+                ok: false,
+            });
+        } catch (recErr) {}
 
         if (!res.headersSent) {
             res.status(500).json({ type: 'error', error: { type: 'api_error', message: e.message } });
         } else {
+            // 流已开：关闭未完结 content block，并补 message_delta(stop_reason) + message_stop
             try {
-                res.write('event: error\ndata: ' + JSON.stringify({ type: 'error', error: { type: 'api_error', message: e.message } }) + '\n\n');
-                res.end();
+                if (!res.writableEnded) {
+                    if (typeof textIdx !== 'undefined' && textIdx >= 0) {
+                        res.write('event: content_block_stop\ndata: ' + JSON.stringify({ type: 'content_block_stop', index: textIdx }) + '\n\n');
+                    }
+                    stopThinkBlock();
+                    res.write('event: message_delta\ndata: ' + JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 0 } }) + '\n\n');
+                    res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+                    res.end();
+                }
             } catch (e2) {}
         }
     }
