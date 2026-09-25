@@ -723,14 +723,11 @@ router.post('/v1/chat/completions', async (req, res) => {
         };
 
         if (stream) {
-            // 若流式输出中从未输出过任何正文内容，但存在思考内容，补发思考内容作为 content 帧（防止只认 content 的客户端空显）
-            if (!content && (r.thinking || thinking) && !parsed.toolCalls.length) {
-                const thinkText = r.thinking || thinking;
-                if (!oaiRoleSent) {
-                    res.write('data: ' + JSON.stringify(oaiChunk(id, { role: 'assistant' }, body.model)) + '\n\n');
-                    oaiRoleSent = true;
-                }
-                res.write('data: ' + JSON.stringify(oaiChunk(id, { content: thinkText }, body.model)) + '\n\n');
+            // 若流式输出中从未输出过任何帧（无 role 无 thinking 无 content），补发空 role 帧以保证协议合法
+            if (!content && !oaiRoleSent && !parsed.toolCalls.length) {
+                ensureStreamHeaders();
+                res.write('data: ' + JSON.stringify(oaiChunk(id, { role: 'assistant', content: '' }, body.model)) + '\n\n');
+                oaiRoleSent = true;
             }
 
             for (let i = 0; i < parsed.toolCalls.length; i++) {
@@ -754,10 +751,7 @@ router.post('/v1/chat/completions', async (req, res) => {
             res.write('data: [DONE]\n\n');
             res.end();
         } else {
-            let finalContent = parsed.toolCalls.length ? (parsed.content || null) : parsed.content;
-            if (!finalContent && (r.thinking || thinking)) {
-                finalContent = r.thinking || thinking;
-            }
+            let finalContent = parsed.toolCalls.length ? (parsed.content || null) : (parsed.content || '');
             const msg = { role: 'assistant', content: finalContent };
             if (r.thinking || thinking) msg.reasoning_content = r.thinking || thinking;
             if (parsed.toolCalls.length) msg.tool_calls = parsed.toolCalls;
@@ -907,14 +901,8 @@ router.post('/v1/messages', async (req, res) => {
         const parsed = (r.hasTools || hasTools) ? parseToolCalls(rawContent) : { content: rawContent, toolCalls: [] };
         const finish = parsed.toolCalls.length ? 'tool_use' : 'end_turn';
 
-        // 若流式输出中从未输出过任何 text delta，但有 thinking 输出，补发思考内容作为 text block 内容（防止客户端空显）
-        if (stream && !content && (r.thinking || thinking) && !parsed.toolCalls.length) {
-            const idx = textBlockIndex();
-            const thinkText = r.thinking || thinking;
-            res.write('event: content_block_delta\ndata: ' + JSON.stringify({ type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text: thinkText } }) + '\n\n');
-            content = thinkText;
-        } else if (stream && textIdx < 0 && !parsed.toolCalls.length) {
-            // 无 text 增量时也保证至少有一个 text 块（客户端期待固定块序）
+        // 保证在有需要时补齐 text 块（客户端期待固定块序），但绝不把 thinking 重复复制为 text_delta 泄露到正文
+        if (stream && textIdx < 0 && !parsed.toolCalls.length) {
             textBlockIndex();
         }
 
@@ -970,8 +958,8 @@ router.post('/v1/messages', async (req, res) => {
             if (r.thinking || thinking) {
                 blocks.push({ type: 'thinking', thinking: r.thinking || thinking, signature: 'sig_' + id.slice(-8) });
             }
-            const effectiveText = rawContent || ((r.thinking || thinking) ? (r.thinking || thinking) : '');
-            if (effectiveText) blocks.push({ type: 'text', text: effectiveText });
+            const effectiveText = rawContent || '';
+            if (effectiveText || !blocks.length) blocks.push({ type: 'text', text: effectiveText });
             for (const tc of parsed.toolCalls) {
                 blocks.push({
                     type: 'tool_use',

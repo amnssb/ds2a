@@ -543,6 +543,7 @@ async function completion(opts) {
         // 片段 ID -> 类型（'thinking' | 'text'）
         const fragmentTypes = new Map();
         let currentFragmentId = -1;
+        let thinkingFinished = false; // 标记思考阶段是否已明确完成
         let abortedMidStream = false;
 
         const emit = (type, d) => {
@@ -575,12 +576,37 @@ async function completion(opts) {
                 tokens = Number(j.v) || tokens;
                 return;
             }
-            if (/^response\/fragments\/-?\d+\/status$/.test(p)) return;
+
+            // 片段状态判断：若思考片段（通常为 fragment 0）结束，标记思考完成，切换为正文模式
+            const fragStatusMatch = p.match(/^response\/fragments\/(-?\d+)\/status$/);
+            if (fragStatusMatch) {
+                const sFid = Number(fragStatusMatch[1]);
+                const st = typeof j.v === 'string' ? j.v.toUpperCase() : '';
+                if (st === 'FINISHED') {
+                    if (sFid === 0 || fragmentTypes.get(sFid) === 'thinking') {
+                        thinkingFinished = true;
+                        currentType = 'text';
+                    }
+                }
+                return;
+            }
+
             if (p === 'response/search_status' || p === 'search_status') {
                 emit('search_status', j.v);
                 return;
             }
-            if (p === 'response/status' || p === 'status' || p === 'quasi_status' || p === 'response/quasi_status') {
+
+            // quasi_status 为 DeepSeek 阶段性准状态（如思考结束时发送 FINISHED），代表思考完成，绝对不是整个响应结束！
+            if (p === 'response/quasi_status' || p === 'quasi_status') {
+                if (typeof j.v === 'string' && j.v.toUpperCase() === 'FINISHED') {
+                    thinkingFinished = true;
+                    currentType = 'text';
+                }
+                return;
+            }
+
+            // 只有整条响应的根状态 finished 才代表模型输出全部完毕
+            if (p === 'response/status' || p === 'status') {
                 if (typeof j.v === 'string' && j.v.toUpperCase() === 'FINISHED') {
                     finished = true;
                 }
@@ -603,17 +629,19 @@ async function completion(opts) {
                     const ty = String(frag.type || '').toUpperCase();
                     const isThink = (ty === 'THINK' || ty === 'THINKING');
                     if (typeof frag.id === 'number') {
-                        fragmentTypes.set(frag.id, isThink ? 'thinking' : 'text');
                         currentFragmentId = frag.id;
+                        fragmentTypes.set(frag.id, isThink ? 'thinking' : 'text');
                     }
-                    if (ty === 'RESPONSE' || ty === 'TEXT') {
-                        currentType = 'text';
-                    } else if (isThink) {
+                    if (isThink && !thinkingFinished) {
                         currentType = 'thinking';
+                    } else if (ty || thinkingFinished) {
+                        // 一旦出现明确的正文片段类型（如 RESPONSE/TEXT），思考彻底完成
+                        thinkingFinished = true;
+                        currentType = 'text';
                     }
                     const c = typeof frag.content === 'string' ? frag.content : '';
                     if (!c) continue;
-                    if (isThink) {
+                    if (currentType === 'thinking' && !thinkingFinished) {
                         thinking += c;
                         emit('thinking', c);
                     } else {
@@ -635,29 +663,35 @@ async function completion(opts) {
                         const fc = typeof frag.content === 'string' ? frag.content : '';
                         const isThink = (ty === 'THINK' || ty === 'THINKING');
                         if (typeof frag.id === 'number') {
-                            fragmentTypes.set(frag.id, isThink ? 'thinking' : 'text');
                             currentFragmentId = frag.id;
+                            fragmentTypes.set(frag.id, isThink ? 'thinking' : 'text');
                         }
-                        if (isThink) {
+                        if (isThink && !thinkingFinished) {
                             currentType = 'thinking';
                             if (fc) { gotThinkFromFragments = true; thinking += fc; emit('thinking', fc); }
                         } else {
+                            thinkingFinished = true;
                             currentType = 'text';
                             if (fc) { content += fc; emit('content', fc); }
                         }
                     }
-                } else if (typeof rr.type === 'string' && (rr.type === 'THINK' || rr.type === 'RESPONSE' || rr.type === 'TEXT')) {
+                } else if (typeof rr.type === 'string') {
                     // 单个 fragment 对象 (如 {"p":"response/fragments/0", "v":{"id":0, "type":"THINK"}})
                     const ty = String(rr.type).toUpperCase();
                     const isThink = (ty === 'THINK' || ty === 'THINKING');
                     if (typeof rr.id === 'number') {
-                        fragmentTypes.set(rr.id, isThink ? 'thinking' : 'text');
                         currentFragmentId = rr.id;
+                        fragmentTypes.set(rr.id, isThink ? 'thinking' : 'text');
                     }
-                    currentType = isThink ? 'thinking' : 'text';
+                    if (isThink && !thinkingFinished) {
+                        currentType = 'thinking';
+                    } else {
+                        thinkingFinished = true;
+                        currentType = 'text';
+                    }
                     const fc = typeof rr.content === 'string' ? rr.content : '';
                     if (fc) {
-                        if (isThink) { thinking += fc; emit('thinking', fc); }
+                        if (currentType === 'thinking' && !thinkingFinished) { thinking += fc; emit('thinking', fc); }
                         else { content += fc; emit('content', fc); }
                     }
                 } else {
@@ -684,11 +718,20 @@ async function completion(opts) {
             const typeMatch = p.match(/^response\/fragments\/(-?\d+)\/type$/);
             if (typeMatch && typeof j.v === 'string') {
                 const rawId = Number(typeMatch[1]);
-                const fid = rawId < 0 ? currentFragmentId : rawId;
                 const ty = j.v.toUpperCase();
                 const isThink = (ty === 'THINK' || ty === 'THINKING');
-                if (fid >= 0) fragmentTypes.set(fid, isThink ? 'thinking' : 'text');
-                currentType = isThink ? 'thinking' : 'text';
+                if (rawId >= 0) {
+                    currentFragmentId = rawId;
+                    fragmentTypes.set(rawId, isThink ? 'thinking' : 'text');
+                } else if (currentFragmentId >= 0) {
+                    fragmentTypes.set(currentFragmentId, isThink ? 'thinking' : 'text');
+                }
+                if (isThink && !thinkingFinished) {
+                    currentType = 'thinking';
+                } else {
+                    thinkingFinished = true;
+                    currentType = 'text';
+                }
                 return;
             }
 
@@ -701,21 +744,29 @@ async function completion(opts) {
                 const fm = p.match(/^response\/fragments\/(-?\d+)\/(thinking_content|content)$/);
                 if (fm) {
                     const rawId = Number(fm[1]);
+                    if (rawId >= 0) currentFragmentId = rawId;
                     const fid = rawId < 0 ? currentFragmentId : rawId;
                     if (fm[2] === 'thinking_content') {
                         currentType = 'thinking';
                     } else if (fm[2] === 'content') {
-                        const known = fragmentTypes.get(fid);
-                        // 正文字段 content 默认即为 text，仅在已确认为 thinking 时分类为 thinking
-                        currentType = known ? known : 'text';
+                        if (thinkingFinished) {
+                            currentType = 'text';
+                        } else {
+                            const known = fragmentTypes.get(fid);
+                            if (known) {
+                                currentType = (known === 'thinking' && !thinkingFinished) ? 'thinking' : 'text';
+                            } else {
+                                currentType = (currentType === 'thinking' && !thinkingFinished) ? 'thinking' : 'text';
+                            }
+                        }
                     }
                 } else if (p) {
                     // 未知或特定路径
                     const pathSaysThink = /thinking|think/i.test(p);
                     const pathSaysText = /(^|\/)(content|text)(_|$)/i.test(p) && !pathSaysThink;
                     if (typeof j.v === 'string') {
-                        if (pathSaysThink) { thinking += j.v; emit('thinking', j.v); return; }
-                        else if (pathSaysText) { content += j.v; emit('content', j.v); return; }
+                        if (pathSaysThink && !thinkingFinished) { thinking += j.v; emit('thinking', j.v); return; }
+                        else if (pathSaysText || thinkingFinished) { content += j.v; emit('content', j.v); return; }
                     }
                 }
             }
@@ -724,7 +775,7 @@ async function completion(opts) {
             let text = null;
             if (typeof j.v === 'string') text = j.v;
             if (text == null || text === '') return;
-            if (text === 'FINISHED' && (!p || p === 'status' || p === 'response/status')) {
+            if (text === 'FINISHED' && (p === 'status' || p === 'response/status')) {
                 finished = true;
                 return;
             }
@@ -732,7 +783,7 @@ async function completion(opts) {
             // 引用标记捕获
             if (/\[citation:\d+\]/.test(text)) citations.push(text);
 
-            if (currentType === 'thinking') {
+            if (currentType === 'thinking' && !thinkingFinished) {
                 thinking += text;
                 emit('thinking', text);
             } else {
