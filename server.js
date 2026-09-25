@@ -151,6 +151,12 @@ const server = app.listen(config.PORT, config.HOST, () => {
     }
 });
 
+// 解除 Node.js HTTP 默认请求超时（默认 5 分钟），保证超长思考与大吞吐流式不被网关强制掐断
+server.requestTimeout = 0;
+server.headersTimeout = 0;
+server.timeout = 0;
+server.keepAliveTimeout = 65000;
+
 setupGracefulShutdown(server);
 
 module.exports = app;

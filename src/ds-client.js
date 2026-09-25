@@ -536,6 +536,7 @@ async function completion(opts) {
         let tokens = 0;
         const citations = [];
         let finished = false;
+        let finishReason = null;
         let sawAnyEvent = false;
 
         // 状态机：记录当前增量是属于正文还是思考链
@@ -587,6 +588,8 @@ async function completion(opts) {
                         thinkingFinished = true;
                         currentType = 'text';
                     }
+                } else if (st === 'INCOMPLETE') {
+                    if (!finishReason) finishReason = 'length';
                 }
                 return;
             }
@@ -598,17 +601,29 @@ async function completion(opts) {
 
             // quasi_status 为 DeepSeek 阶段性准状态（如思考结束时发送 FINISHED），代表思考完成，绝对不是整个响应结束！
             if (p === 'response/quasi_status' || p === 'quasi_status') {
-                if (typeof j.v === 'string' && j.v.toUpperCase() === 'FINISHED') {
-                    thinkingFinished = true;
-                    currentType = 'text';
+                if (typeof j.v === 'string') {
+                    const qv = j.v.toUpperCase();
+                    if (qv === 'FINISHED') {
+                        thinkingFinished = true;
+                        currentType = 'text';
+                    } else if (qv === 'INCOMPLETE') {
+                        if (!finishReason) finishReason = 'length';
+                    }
                 }
                 return;
             }
 
-            // 只有整条响应的根状态 finished 才代表模型输出全部完毕
+            // 只有整条响应的根状态 finished / INCOMPLETE 才代表模型输出全部完毕
             if (p === 'response/status' || p === 'status') {
-                if (typeof j.v === 'string' && j.v.toUpperCase() === 'FINISHED') {
-                    finished = true;
+                if (typeof j.v === 'string') {
+                    const st = j.v.toUpperCase();
+                    if (st === 'FINISHED') {
+                        finished = true;
+                        if (!finishReason) finishReason = 'stop';
+                    } else if (st === 'INCOMPLETE') {
+                        finished = true;
+                        finishReason = 'length';
+                    }
                 }
                 return;
             }
@@ -775,9 +790,17 @@ async function completion(opts) {
             let text = null;
             if (typeof j.v === 'string') text = j.v;
             if (text == null || text === '') return;
-            if (text === 'FINISHED' && (p === 'status' || p === 'response/status')) {
-                finished = true;
-                return;
+            if (typeof j.v === 'string' && (p === 'status' || p === 'response/status')) {
+                const st = text.toUpperCase();
+                if (st === 'FINISHED') {
+                    finished = true;
+                    if (!finishReason) finishReason = 'stop';
+                    return;
+                } else if (st === 'INCOMPLETE') {
+                    finished = true;
+                    finishReason = 'length';
+                    return;
+                }
             }
 
             // 引用标记捕获
@@ -895,7 +918,7 @@ async function completion(opts) {
             }
         }
 
-        return { content, thinking, messageId, tokens, citations };
+        return { content, thinking, messageId, tokens, citations, finishReason: finishReason || 'stop' };
     } finally {
         if (stallTimer) clearTimeout(stallTimer);
     }

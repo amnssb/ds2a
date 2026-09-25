@@ -625,6 +625,7 @@ function oaiFinish(id, reason, model) {
 }
 
 router.post('/v1/chat/completions', async (req, res) => {
+    if (req.socket) req.socket.setTimeout(0);
     const t0 = Date.now();
     const id = 'chatcmpl-' + crypto.randomBytes(10).toString('hex');
     const body = req.body || {};
@@ -698,7 +699,7 @@ router.post('/v1/chat/completions', async (req, res) => {
 
         const rawContent = r.content || content;
         const parsed = (r.hasTools || hasTools) ? parseToolCalls(rawContent) : { content: rawContent, toolCalls: [] };
-        const finish = parsed.toolCalls.length ? 'tool_calls' : 'stop';
+        const finish = parsed.toolCalls.length ? 'tool_calls' : (r.finishReason === 'length' ? 'length' : 'stop');
 
         const { pTokens, cTokens, tTokens, totalTokens } = computeUsage(r, body, rawContent, thinking);
 
@@ -808,6 +809,7 @@ router.post('/v1/chat/completions', async (req, res) => {
 
 // ===== Claude 兼容端点 (/v1/messages) =====
 router.post('/v1/messages', async (req, res) => {
+    if (req.socket) req.socket.setTimeout(0);
     const t0 = Date.now();
     const id = 'msg_' + crypto.randomBytes(12).toString('hex');
     const body = req.body || {};
@@ -899,7 +901,7 @@ router.post('/v1/messages', async (req, res) => {
 
         const rawContent = r.content || content;
         const parsed = (r.hasTools || hasTools) ? parseToolCalls(rawContent) : { content: rawContent, toolCalls: [] };
-        const finish = parsed.toolCalls.length ? 'tool_use' : 'end_turn';
+        const finish = parsed.toolCalls.length ? 'tool_use' : (r.finishReason === 'length' ? 'max_tokens' : 'end_turn');
 
         // 保证在有需要时补齐 text 块（客户端期待固定块序），但绝不把 thinking 重复复制为 text_delta 泄露到正文
         if (stream && textIdx < 0 && !parsed.toolCalls.length) {
