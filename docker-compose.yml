@@ -24,14 +24,16 @@ services:
       # 持久化挂载：配置文件、Token 统计与历史日志保存在宿主机项目目录下
       - ./data:/app/data
       - ./logs:/app/logs
-    # 容器资源上限（适配低配 VPS 或本地轻量运行）
+    # 共享内存（适配无头 Chromium 渲染页面避免崩溃）
+    shm_size: '256mb'
+    # 容器资源上限（适配低配 VPS，预留无头浏览器启动弹性空间）
     deploy:
       resources:
         limits:
           cpus: '2.00'
-          memory: 512M
+          memory: 1024M
         reservations:
-          memory: 128M
+          memory: 256M
     logging:
       driver: "json-file"
       options:

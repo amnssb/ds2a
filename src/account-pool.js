@@ -418,7 +418,7 @@ class AccountPool {
     async triggerAutoRelogin(account) {
         logger.info(`正在为账号 ${account.name} 尝试自动重新登录刷新 Token...`);
         try {
-            const dsLogin = require('../ds-login');
+            const dsLogin = require('./ds-login');
             const opts = { ...account };
             if (account.deviceId) opts.deviceId = account.deviceId;
             const r = await dsLogin.loginAccount(opts);
@@ -434,12 +434,19 @@ class AccountPool {
                 this.updateAccount(account.index, patch);
                 return true;
             } else {
-                logger.err(`账号 ${account.name} 自动重登未成功: ${r.error || '未知原因'}`);
-                if (r.deviceId) this.updateAccount(account.index, { deviceId: r.deviceId });
+                const failReason = r.error || '自动重登未成功';
+                logger.err(`账号 ${account.name} 自动重登未成功: ${failReason}`);
+                const failPatch = {
+                    lastLoginError: failReason,
+                    paused: true,
+                };
+                if (r.deviceId) failPatch.deviceId = r.deviceId;
+                this.updateAccount(account.index, failPatch);
                 return false;
             }
         } catch (e) {
             logger.err(`账号 ${account.name} 自动重登异常: ${e.message}`);
+            this.updateAccount(account.index, { lastLoginError: '自动重登异常: ' + e.message, paused: true });
             return false;
         }
     }

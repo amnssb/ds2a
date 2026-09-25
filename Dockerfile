@@ -21,23 +21,36 @@ FROM ${NODE_IMAGE} AS runner
 USER root
 WORKDIR /app
 
-# 离线 base（由旧 ds-gateway 导出）通常已含 tini/tzdata/curl，避免再跑 apk 权限/网络问题
+# 离线 base（由旧 ds-gateway 导出）通常已含 tini/tzdata/curl，若缺则安装运行依赖与无头 Chromium
 RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apk/repositories || true; \
-    if command -v tini >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && [ -f /usr/share/zoneinfo/Asia/Shanghai ]; then \
-      echo 'skip apk: tini/curl/tzdata already present'; \
-    else \
-      apk add --no-cache tini tzdata curl; \
-    fi; \
-    cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime; \
-    echo "Asia/Shanghai" > /etc/timezone
+    sed -i 's/^#\(.*\/community\)/\1/' /etc/apk/repositories || true; \
+    apk update || true; \
+    apk add --no-cache \
+      tini \
+      tzdata \
+      curl \
+      chromium \
+      nss \
+      freetype \
+      harfbuzz \
+      ca-certificates \
+      ttf-freefont \
+      font-noto-cjk || true; \
+    if [ -f /usr/share/zoneinfo/Asia/Shanghai ]; then \
+      cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime; \
+      echo "Asia/Shanghai" > /etc/timezone; \
+    fi
 
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
 ENV PORT=19728
 ENV DOCKER_CONTAINER=1
+ENV CHROME_BIN=/usr/bin/chromium-browser
+ENV CHROME_PATH=/usr/bin/chromium-browser
+ENV DS_CHROME=/usr/bin/chromium-browser
 
-# 创建持久化数据与日志挂载目录并赋予 node 用户权限
-RUN mkdir -p /app/data /app/logs /app/vendor && chown -R node:node /app
+# 创建持久化数据与日志挂载目录、浏览器 Profile 目录并赋予 node 用户权限
+RUN mkdir -p /app/data /app/logs /app/vendor /app/.chrome-profiles && chown -R node:node /app
 
 # 从依赖构建阶段复制 node_modules
 COPY --chown=node:node --from=deps /app/node_modules ./node_modules

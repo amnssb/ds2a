@@ -76,11 +76,24 @@ pm2 startup
 pm2 save
 ```
 
+> [!TIP]
+> **开启服务器无头自愈刷新**：如果希望在 Linux 服务器上发生 Token 过期时能自动无头登录刷新，只需在宿主机安装 Chromium 与中文字体喵：
+> ```bash
+> # Ubuntu / Debian
+> sudo apt update && sudo apt install -y chromium-browser fonts-noto-cjk
+> 
+> # CentOS / RHEL
+> sudo yum install -y chromium google-noto-cjk-fonts
+> ```
+
 ---
 
 ### 方式二：Docker / Docker Compose 部署
 
 适用于容器化集群、Linux 云服务器或轻量 NAS 一键编排喵。
+
+> [!NOTE]
+> **内置无头 Chromium 自愈**：容器内已预装 Chromium、CJK 中文字体与 256MB 共享内存支持喵。当账号 40003 过期时，网关会自动在容器内调用无头 Chromium 执行自愈重登，并在完成后自动释放内存喵。
 
 #### 使用 Docker Compose（推荐）
 
@@ -110,6 +123,7 @@ docker build -t ds2a:latest .
 docker run -d \
   --name ds-gateway \
   -p 19728:19728 \
+  --shm-size=256m \
   --add-host=host.docker.internal:host-gateway \
   -e DOCKER_CONTAINER=1 \
   -v $(pwd)/data:/app/data \
@@ -165,6 +179,15 @@ npm run studio
 - 粘贴多行代理列表，一键将代理轮询均分给所有账号或选定账号喵。
 - 调度本地 Chrome 自动执行有头/无头换 Token 任务喵。
 - 换完后一键「上行同步」至远端服务器网关（19728 端口），服务端自动生效喵。
+
+---
+
+### 方式五：双端协同架构（服务端无头自动刷新 + 本机电脑人工兜底）
+
+生产推荐架构喵：
+1. **日常运行（零人工）**：服务端（Docker 或 PM2）内置无头 Chromium，遇到账号 Token 到期（40003）时后台静默自愈重登刷新，并在成功后自动写回 `accounts.json` 恢复调度喵。
+2. **风控拦截保护**：如果服务器机房出口 IP 遭遇 AWS WAF 强人机挑战、极验滑块或验证码导致无头登录未通过，服务端会记录详细错误原因并自动暂停该账号，防止被风控封号喵。
+3. **本机电脑一键补刀**：在本地电脑上执行 `npm run push-tokens` 或在 Studio 中运行有头模式，本地弹出可见浏览器窗口完成人工滑动/验证码后，自动通过 API 将刷新出的 Token 推送并覆盖到远端服务器生效喵。
 
 ---
 
