@@ -491,7 +491,7 @@ $('#btnPush').onclick = async () => {
 $('#btnPull').onclick = async () => {
   try {
     const r = await api('/api/job/pull', { method: 'POST', body: '{}' });
-    logLine('拉取状态 ' + r.count + ' 条');
+    logLine('拉取状态 ' + r.count + ' 条' + (r.synced ? (' · 已自动同步 ' + r.synced + ' 个账号/代理到本地') : ''));
     await loadRows();
   } catch (e) { toast(e.message, 'err'); }
 };

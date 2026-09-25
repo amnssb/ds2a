@@ -205,7 +205,8 @@ async function pullStatus() {
     const cookie = await remote.login(cfg.remoteBase, cfg.remoteUser, cfg.remotePass);
     const st = await remote.getStatus(cfg.remoteBase, cookie);
     store.saveStatusMirror({ at: Date.now(), accounts: st.accounts || [] });
-    return { ok: true, at: st.at, count: (st.accounts || []).length, cookieHint: true };
+    const synced = store.syncFromRemoteStatus(st.accounts || []);
+    return { ok: true, at: st.at, count: (st.accounts || []).length, synced, cookieHint: true };
 }
 
 module.exports = { runTokenJob, runPushOnly, pullStatus, jobSnapshot };

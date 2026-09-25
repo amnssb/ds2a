@@ -21,6 +21,21 @@ const STATUS = {
     DISABLED: 'disabled',
 };
 
+function isDummyAccount(a) {
+    if (!a || typeof a !== 'object') return true;
+    const name = String(a.name || '').trim();
+    const token = String(a.token || '').trim();
+    const email = String(a.email || '').trim();
+    const mobile = String(a.mobile || '').trim();
+    const password = String(a.password || '').trim();
+
+    if (name === 'acc1' && (email === 'your@email.com' || token === 'ZMGZOj1u3WLmpqXxb5PbeB9uE5xS0TT2C6qhq0Sp37i9IZ44DyIHTKyBH7bQkEJP' || token === 'YOUR_DEEPSEEK_USER_TOKEN_HERE')) return true;
+    if (name === 'acc2' && (mobile === '13800138000' || password === 'your-password')) return true;
+    if (name === 'acc3' && (token.includes('真实有效 token') || token.includes('AI 测试时禁止填假 token'))) return true;
+    if (email === 'your@email.com' || mobile === '13800138000' || password === 'your-password') return true;
+    return false;
+}
+
 class AccountPool {
     constructor() {
         this.dataFile = config.ACCOUNTS_FILE;
@@ -31,20 +46,28 @@ class AccountPool {
         this.reload();
     }
 
-    /** 读取原始账号数据，支持双向比对合并（带 mtime 缓存，避免热路径反复读盘） */
+    /** 读取原始账号数据，以 data/accounts.json 为唯一权威源，过滤假账号示例 */
     readRaw() {
-        // mtime 未变化时直接复用上次合并结果：文件级 stat 开销远小于每次全量读盘+JSON.parse
         let mRoot = -1;
         let mData = -1;
         try { mRoot = fs.existsSync(this.rootFile) ? fs.statSync(this.rootFile).mtimeMs : -1; } catch (e) {}
         try { mData = fs.existsSync(this.dataFile) ? fs.statSync(this.dataFile).mtimeMs : -1; } catch (e) {}
         if (this._rawCache && this._rawCache.mRoot === mRoot && this._rawCache.mData === mData) {
-            // 返回浅拷贝，保持"每次读取得到独立副本"的旧语义，调用方可安全原地修改后再写回
             return this._rawCache.merged.map(x => ({ ...x }));
         }
 
         let rootList = [];
         let dataList = [];
+        let hasData = false;
+
+        try {
+            config.assertNotCDrive(this.dataFile);
+            if (fs.existsSync(this.dataFile)) {
+                dataList = JSON.parse(fs.readFileSync(this.dataFile, 'utf8'));
+                if (!Array.isArray(dataList)) dataList = [];
+                hasData = true;
+            }
+        } catch (e) {}
 
         try {
             if (fs.existsSync(this.rootFile)) {
@@ -53,61 +76,27 @@ class AccountPool {
             }
         } catch (e) {}
 
-        try {
-            config.assertNotCDrive(this.dataFile);
-            if (fs.existsSync(this.dataFile)) {
-                dataList = JSON.parse(fs.readFileSync(this.dataFile, 'utf8'));
-                if (!Array.isArray(dataList)) dataList = [];
-            }
-        } catch (e) {}
-
-        // 智能合并：以 token / name 为主键合并最新属性
-        const mergedMap = new Map();
-
-        // 先填充 dataList
-        for (const item of dataList) {
-            const key = item.name || item.token;
-            if (key) mergedMap.set(key, { ...item });
-        }
-
-        // rootList 与 dataList 同 key 时：token 变了以 root 为准并解熔断；其余字段按「非空覆盖」同步
-        let rootHasNew = false;
-        for (const item of rootList) {
-            const key = item.name || item.token;
-            if (!key) continue;
-            if (!mergedMap.has(key)) {
-                mergedMap.set(key, { ...item });
-                rootHasNew = true;
+        let merged = [];
+        if (hasData) {
+            // data/ 为权威主数据；仅当外部明确单独修改了根目录 accounts.json (mRoot > mData) 才接受根目录覆盖
+            if (mRoot > mData && rootList.length > 0) {
+                merged = rootList;
             } else {
-                const existing = mergedMap.get(key);
-                // 如果根目录 token 变动了，重置 paused 状态，触发自动恢复
-                if (item.token && item.token !== existing.token) {
-                    existing.token = item.token;
-                    existing.paused = false;
-                    existing.lastLoginError = '';
-                    rootHasNew = true;
-                }
-                // 同步其余配置字段（password/email 等），避免双文件脱节
-                for (const f of ['email', 'mobile', 'areaCode', 'password', 'autoLogin', 'disabled', 'name', 'deviceId', 'proxy']) {
-                    if (item[f] !== undefined && item[f] !== null && item[f] !== '' && item[f] !== existing[f]) {
-                        existing[f] = item[f];
-                        rootHasNew = true;
-                    }
-                }
+                merged = dataList;
             }
+        } else if (rootList.length > 0) {
+            merged = rootList;
         }
 
-        const merged = [...mergedMap.values()];
-        this._rawCache = { mRoot, mData, merged };
-        if (merged.length === 0 && rootList.length === 0 && dataList.length === 0) {
-            this.writeRaw([]);
-            return [];
-        }
+        // 彻底过滤假账号与示例模板
+        const cleanList = merged.filter(a => !isDummyAccount(a));
+        this._rawCache = { mRoot, mData, merged: cleanList };
 
-        if (rootHasNew) {
-            this.writeRaw(merged);
+        // 若有清洗或尚未同步，立即双向同步写盘
+        if (cleanList.length !== merged.length || !hasData || (mRoot > mData && rootList.length > 0)) {
+            this.writeRaw(cleanList);
         }
-        return merged.map(x => ({ ...x }));
+        return cleanList.map(x => ({ ...x }));
     }
 
     /** 写入磁盘（双向保证 data/accounts.json 和根目录 accounts.json 完全同步） */

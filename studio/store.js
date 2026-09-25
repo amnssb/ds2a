@@ -119,6 +119,53 @@ function saveConfig(patch) {
     return cfg;
 }
 
+/** 将服务端拉取到的最新账号/代理/设备信息反向同步至本地 accounts.json */
+function syncFromRemoteStatus(remoteAccounts) {
+    if (!Array.isArray(remoteAccounts)) return 0;
+    const list = loadAccounts();
+    let updated = 0;
+    for (const r of remoteAccounts) {
+        if (!r || !r.name) continue;
+        let local = list.find(a => a.name === r.name);
+        if (!local) {
+            local = {
+                name: r.name,
+                token: '',
+                email: r.email || '',
+                mobile: r.mobile || '',
+                areaCode: r.areaCode || '+86',
+                password: '',
+                autoLogin: true,
+                disabled: !!r.disabled,
+                deviceId: r.deviceId || '',
+                proxy: r.proxy || '',
+                lastLoginAt: r.lastLoginAt || '',
+                lastLoginError: r.lastError || '',
+            };
+            list.push(local);
+            updated++;
+        } else {
+            let dirty = false;
+            // 服务端 proxy 优先反向同步到本地
+            if (r.proxy !== undefined && r.proxy !== local.proxy) {
+                local.proxy = r.proxy || '';
+                dirty = true;
+            }
+            if (r.deviceId && r.deviceId !== local.deviceId) {
+                local.deviceId = r.deviceId;
+                dirty = true;
+            }
+            if (r.email && !local.email) {
+                local.email = r.email;
+                dirty = true;
+            }
+            if (dirty) updated++;
+        }
+    }
+    if (updated > 0) saveAccounts(list);
+    return updated;
+}
+
 /** 合并本地账号 + 服务端状态镜像 → UI 行 */
 function mergedRows() {
     const locals = loadAccounts();
@@ -134,9 +181,9 @@ function mergedRows() {
             hasPassword: !!(a.password && a.password !== '******'),
             hasLocalToken: !!(a.token && a.token.length > 20 && !a.token.startsWith('{')),
             localTokenPreview: a.token ? (a.token.slice(0, 8) + '…' + a.token.slice(-4)) : '',
-            deviceId: a.deviceId || '',
-            proxy: a.proxy || '',
-            lastLoginAt: a.lastLoginAt || '',
+            deviceId: a.deviceId || (s && s.deviceId) || '',
+            proxy: a.proxy || (s && s.proxy) || '',
+            lastLoginAt: a.lastLoginAt || (s && s.lastLoginAt) || '',
             lastLoginError: a.lastLoginError || '',
             remote: s ? {
                 index: s.index,
@@ -166,4 +213,5 @@ module.exports = {
     loadConfig,
     saveConfig,
     mergedRows,
+    syncFromRemoteStatus,
 };

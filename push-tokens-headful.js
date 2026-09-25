@@ -56,6 +56,8 @@ async function remoteCreate(cookie, acc, token) {
         areaCode: acc.areaCode || '+86',
         password: acc.password || '',
         token: token || '',
+        deviceId: acc.deviceId || '',
+        proxy: acc.proxy || '',
         autoLogin: true,
         disabled: false,
         paused: false,
@@ -206,13 +208,16 @@ async function headfulLogin(acc) {
                 continue;
             }
             try {
-                const pr = await remotePatch(cookie, target.index, {
+                const patchData = {
                     token: item.token,
                     paused: false,
                     lastLoginError: '',
-                });
+                };
+                if (la && la.proxy !== undefined) patchData.proxy = la.proxy || '';
+                if (item.deviceId || (la && la.deviceId)) patchData.deviceId = item.deviceId || la.deviceId;
+                const pr = await remotePatch(cookie, target.index, patchData);
                 results.pushed.push({ name: item.name, index: target.index, ok: true, remote: pr });
-                console.log('⬆ 已推送 ' + item.name + ' -> remote#' + target.index);
+                console.log('⬆ 已推送 ' + item.name + ' -> remote#' + target.index + (patchData.proxy ? (' proxy=' + patchData.proxy) : ''));
             } catch (e) {
                 results.pushed.push({ name: item.name, index: target.index, ok: false, error: e.message });
                 console.log('❌ 推送失败', item.name, e.message);

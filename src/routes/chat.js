@@ -82,23 +82,27 @@ function estimateRequestInputTokens(body) {
 
 /**
  * 统一用量计算：
- * - 上游 accumulated_token_usage 为权威总数（已含 thinking 输出）
- * - 先从总数中扣除 thinking 估算值，避免 60/40 拆分后再叠加 thinking 造成重复计数
- * - 无上游总数时回退为字符启发式估算
+ * - promptTokens: 基于输入请求体（body.messages / system / prompt）准确计算或估算，不人为捏造
+ * - tTokens: 思考链 token 估算值
+ * - cTokens: 模型正文 token 消耗。上游 accumulated_token_usage (r.tokens) 为输出总量（thinking+content），
+ *   扣除 tTokens 即为真实的 completion token；若无上游数值则基于正文估算
+ * - totalTokens: prompt + completion + thinking
  */
-function computeUsage(r, fallbackContent, fallbackThinking) {
+function computeUsage(r, body, fallbackContent, fallbackThinking) {
+    const pTokens = Math.max(1, estimateRequestInputTokens(body) || estimateTokens(r.prompt || ''));
     const tTokens = estimateTokens(fallbackThinking || r.thinking || '');
+    let cTokens = 0;
     if (r.tokens && r.tokens > 0) {
-        const total = Math.max(0, Math.round(r.tokens));
-        const t = Math.min(tTokens, total);
-        const rest = total - t;
-        const p = Math.round(rest * 0.6);
-        const c = rest - p;
-        return { pTokens: p, cTokens: c, tTokens: t, totalTokens: total };
+        const totalOut = Math.max(0, Math.round(r.tokens));
+        cTokens = Math.max(0, totalOut - tTokens);
+        if (cTokens === 0 && (r.content || fallbackContent)) {
+            cTokens = estimateTokens(r.content || fallbackContent);
+        }
+    } else {
+        cTokens = estimateTokens(r.content || fallbackContent || '');
     }
-    const pTokens = estimateTokens(r.prompt);
-    const cTokens = estimateTokens(fallbackContent || '');
-    return { pTokens, cTokens, tTokens, totalTokens: pTokens + cTokens + tTokens };
+    const totalTokens = pTokens + cTokens + tTokens;
+    return { pTokens, cTokens, tTokens, totalTokens };
 }
 
 function contentToText(c) {
@@ -696,7 +700,7 @@ router.post('/v1/chat/completions', async (req, res) => {
         const parsed = (r.hasTools || hasTools) ? parseToolCalls(rawContent) : { content: rawContent, toolCalls: [] };
         const finish = parsed.toolCalls.length ? 'tool_calls' : 'stop';
 
-        const { pTokens, cTokens, tTokens, totalTokens } = computeUsage(r, rawContent, thinking);
+        const { pTokens, cTokens, tTokens, totalTokens } = computeUsage(r, body, rawContent, thinking);
 
         // 记录用量与请求日志（失败不影响已开流的收尾帧）
         accountingSuccess(r, {
@@ -914,7 +918,7 @@ router.post('/v1/messages', async (req, res) => {
             textBlockIndex();
         }
 
-        const { pTokens, cTokens, tTokens } = computeUsage(r, rawContent, thinking);
+        const { pTokens, cTokens, tTokens, totalTokens } = computeUsage(r, body, rawContent, thinking);
         const outTokens = cTokens + tTokens;
 
         accountingSuccess(r, {
