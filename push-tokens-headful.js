@@ -89,13 +89,27 @@ async function remotePatch(cookie, index, patch) {
     try { return JSON.parse(text); } catch { return { raw: text }; }
 }
 
-function saveLocalToken(name, token, deviceId, lastLoginAt) {
+function saveLocalToken(name, token, deviceId, lastLoginAt, extra = {}) {
     const list = loadAccounts();
     const item = list.find(a => a.name === name);
     if (!item) return false;
     item.token = token;
-    item.paused = false;
-    item.lastLoginError = '';
+    if (extra.banned) {
+        item.paused = true;
+        item.lastLoginError = extra.statusMsg || '账号已被官方永久封禁';
+        item.disabledUntil = 0;
+        item.frozenUntil = '';
+    } else if (extra.frozen) {
+        item.paused = false;
+        item.disabledUntil = extra.muteUntil || 0;
+        item.frozenUntil = extra.frozenUntil || '';
+        item.lastLoginError = extra.statusMsg || `账号被官方暂时冻结至 ${extra.frozenUntil}`;
+    } else {
+        item.paused = false;
+        item.disabledUntil = 0;
+        item.frozenUntil = '';
+        item.lastLoginError = '';
+    }
     if (lastLoginAt) item.lastLoginAt = lastLoginAt;
     if (deviceId) item.deviceId = deviceId;
     fs.writeFileSync(LOCAL_ACCOUNTS, JSON.stringify(list, null, 2), 'utf8');
@@ -108,7 +122,7 @@ function saveLocalToken(name, token, deviceId, lastLoginAt) {
 
 async function headfulLogin(acc) {
     console.log('\n========== 有头登录 ' + acc.name + ' (' + (acc.email || acc.mobile) + ') ==========');
-    console.log('将打开 Chrome；有验证码请在窗口点完，或直接手动登录，脚本会自动抓 token 喵');
+    console.log('将打开 Chrome；有验证码请在窗口点完，或直接手动登录，脚本会自动抓 token 与风控状态喵');
     const loginOpts = {
         email: acc.email || '',
         mobile: acc.mobile || '',
@@ -127,7 +141,13 @@ async function headfulLogin(acc) {
     try {
         const r = await dsLogin.loginAccount(loginOpts);
         if (r.ok && r.token) {
-            console.log('✅ ' + acc.name + ' 登录成功 via=' + (r.from || 'api') + ' token=' + String(r.token).slice(0, 16) + '…');
+            if (r.frozen) {
+                console.log('⚠️ ' + acc.name + ' 登录成功，但账号处于【暂时冻结】状态至 ' + r.frozenUntil + '！已自动设置冻结时间喵');
+            } else if (r.banned) {
+                console.log('🚨 ' + acc.name + ' 登录成功，但账号已被官方【永久封禁】: ' + r.statusMsg + '！已标记暂停调度喵');
+            } else {
+                console.log('✅ ' + acc.name + ' 登录成功 via=' + (r.from || 'api') + ' token=' + String(r.token).slice(0, 16) + '…');
+            }
             // 账号间强制关窗，避免会话串号
             try { await dsLogin.closeSharedBrowser(); } catch (e) {}
             return r;
@@ -154,13 +174,18 @@ async function headfulLogin(acc) {
         const r = await headfulLogin(acc);
         if (r.ok && r.token) {
             const at = new Date().toISOString();
-            saveLocalToken(acc.name, r.token, r.deviceId || acc.deviceId || '', at);
+            saveLocalToken(acc.name, r.token, r.deviceId || acc.deviceId || '', at, r);
             results.items.push({
                 name: acc.name,
                 ok: true,
                 token: r.token,
                 deviceId: r.deviceId || '',
                 lastLoginAt: at,
+                frozen: r.frozen,
+                banned: r.banned,
+                muteUntil: r.muteUntil,
+                frozenUntil: r.frozenUntil,
+                statusMsg: r.statusMsg,
             });
         } else {
             results.items.push({
@@ -210,9 +235,19 @@ async function headfulLogin(acc) {
             try {
                 const patchData = {
                     token: item.token,
-                    paused: false,
-                    lastLoginError: '',
+                    lastLoginError: item.statusMsg || '',
                 };
+                if (item.banned) {
+                    patchData.paused = true;
+                } else if (item.frozen) {
+                    patchData.paused = false;
+                    patchData.disabledUntil = item.muteUntil;
+                    patchData.frozenUntil = item.frozenUntil;
+                } else {
+                    patchData.paused = false;
+                    patchData.disabledUntil = 0;
+                    patchData.frozenUntil = '';
+                }
                 if (la && la.proxy !== undefined) patchData.proxy = la.proxy || '';
                 if (item.deviceId || (la && la.deviceId)) patchData.deviceId = item.deviceId || la.deviceId;
                 const pr = await remotePatch(cookie, target.index, patchData);

@@ -191,41 +191,12 @@ router.post('/api/accounts/:index/test', async (req, res) => {
     }
 });
 
-// 账号密码换取 Token (自动登录)
+// 服务端无头补登已卸载，引导用户通过本机有头或 Studio 推送
 router.post('/api/accounts/:index/login', async (req, res) => {
-    const idx = Number(req.params.index);
-    const acc = accountPool.accounts[idx];
-    if (!acc) return res.status(404).json({ error: '账号不存在' });
-    if (!acc.password || (!acc.email && !acc.mobile)) {
-        return res.status(400).json({ error: '缺少账号或密码，无法自动登录' });
-    }
-
-    try {
-        const dsLogin = require('../ds-login');
-        const loginOpts = { ...acc };
-        if (acc.deviceId) loginOpts.deviceId = acc.deviceId;
-        const r = await dsLogin.loginAccount(loginOpts);
-        if (r.ok && r.token) {
-            const patch = {
-                token: r.token,
-                paused: false,
-                lastLoginAt: new Date().toISOString(),
-                lastLoginError: '',
-            };
-            if (r.deviceId) patch.deviceId = r.deviceId;
-            accountPool.updateAccount(idx, patch);
-            accountPool.resumeAccount(idx);
-            res.json({ ok: true, token: r.token, deviceId: r.deviceId || '' });
-        } else {
-            const err = r.error || '登录失败';
-            const patch = { lastLoginError: err };
-            if (r.deviceId) patch.deviceId = r.deviceId;
-            accountPool.updateAccount(idx, patch);
-            res.status(400).json({ ok: false, error: err, deviceId: r.deviceId || '' });
-        }
-    } catch (e) {
-        res.status(500).json({ ok: false, error: e.message });
-    }
+    res.status(400).json({
+        ok: false,
+        error: '服务端已卸载无头补登，请使用本机电脑运行 npm run push-tokens（有头窗口人工过验证）后自动推送 Token 喵'
+    });
 });
 
 module.exports = router;

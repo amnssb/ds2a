@@ -43,13 +43,7 @@ class AccountPool {
         this.accounts = [];
         this.cursor = 0;
         this._rawCache = null;
-        this._sweeping = false;
         this.reload();
-        // 开机 5 秒后主动扫描并自动自愈拉活已失效/暂停的账号；之后每 10 分钟定期巡检一次
-        const t1 = setTimeout(() => this.sweepAndAutoHeal().catch(() => {}), 5000);
-        if (t1.unref) t1.unref();
-        const t2 = setInterval(() => this.sweepAndAutoHeal().catch(() => {}), 10 * 60 * 1000);
-        if (t2.unref) t2.unref();
     }
 
     /** 读取原始账号数据，以 data/accounts.json 为唯一权威源，过滤假账号示例 */
@@ -157,6 +151,19 @@ class AccountPool {
             const name = item.name || ('acc' + (i + 1));
             const prev = prevMap.get(name);
             const tokenChanged = prev && prev.token !== item.token;
+            // 从持久化数据或前一状态中继承冻结与冷却时间
+            let disabledUntil = (prev && !tokenChanged) ? prev.disabledUntil : 0;
+            let frozenUntil = (prev && !tokenChanged) ? (prev.frozenUntil || '') : '';
+            if (item.disabledUntil && Number(item.disabledUntil) > Date.now()) {
+                disabledUntil = Math.max(disabledUntil, Number(item.disabledUntil));
+            }
+            if (item.frozenUntil) {
+                const fMs = new Date(item.frozenUntil).getTime();
+                if (!isNaN(fMs) && fMs > Date.now()) {
+                    disabledUntil = Math.max(disabledUntil, fMs);
+                    frozenUntil = item.frozenUntil;
+                }
+            }
 
             // 如果 Token 改变了，自动重置故障状态
             const isPaused = tokenChanged ? false : !!item.paused;
@@ -164,6 +171,7 @@ class AccountPool {
             if (tokenChanged) state = STATUS.HEALTHY;
             else if (item.disabled) state = STATUS.DISABLED;
             else if (isPaused) state = STATUS.PAUSED;
+            else if (disabledUntil > Date.now()) state = STATUS.COOLDOWN;
             else if (prev && prev.state !== STATUS.DISABLED && prev.state !== STATUS.PAUSED) state = prev.state;
             else state = STATUS.HEALTHY;
 
@@ -181,7 +189,8 @@ class AccountPool {
                 disabled: !!item.disabled,
                 paused: isPaused,
                 state,
-                disabledUntil: (prev && !tokenChanged) ? prev.disabledUntil : 0,
+                disabledUntil,
+                frozenUntil,
                 failures: (prev && !tokenChanged) ? prev.failures : 0,
                 okCount: prev ? prev.okCount : 0,
                 errCount: prev ? prev.errCount : 0,
@@ -318,27 +327,28 @@ class AccountPool {
             throw this._noAccountError(`可用账号已熔断暂停（原因: ${firstErr}），请在控制台「账号管理」中更新有效 Token 喵`, accName);
         }
 
-        // 5. 若未排除账号都在冷却期中，挑选冷却时间最快到期/在途最少的账号立即尝试自愈，绝不因冷却直接拒绝调度
+        // 5. 若未排除账号都在冷却/冻结期中，严禁强行放行进循环，明确抛出最近解冻时间
         const cooldownList = nonExcluded.filter(a => now < a.disabledUntil && !a.paused && a.state !== STATUS.AUTH_FAILED);
         if (cooldownList.length > 0) {
-            cooldownList.sort((a, b) => {
-                if (a.disabledUntil !== b.disabledUntil) return a.disabledUntil - b.disabledUntil;
-                return (a.inflight || 0) - (b.inflight || 0);
-            });
+            cooldownList.sort((a, b) => a.disabledUntil - b.disabledUntil);
             const best = cooldownList[0];
-            const waitSec = Math.max(0, Math.round((best.disabledUntil - now) / 1000));
-            logger.warn(`账号池暂时都在冷却中，优先借用最快解冻账号 ${best.name}（余 ${waitSec}s）尝试自愈，保持调度不中断喵`);
-            best.inflight = Math.max(0, (best.inflight || 0) + 1);
-            best.lastUsedAt = now;
-            return best;
+            const waitSec = Math.max(1, Math.round((best.disabledUntil - now) / 1000));
+            const freezeInfo = best.frozenUntil ? `（解冻时间: ${new Date(best.disabledUntil).toLocaleString()}）` : '';
+            logger.warn(`账号池所有可用账号均在冷却/冻结中，最近解冻账号 ${best.name}${freezeInfo}，需等待 ${waitSec}s，拒绝本次调度以防死循环喵`);
+            throw this._noAccountError(`所有可用账号均在冷却/冻结中${freezeInfo}（最快需等待 ${waitSec} 秒），请稍后重试喵`, best.name);
         }
 
-        // 6. 兜底选择在途请求最少的账号，绝不轻易无端拒绝请求
-        nonExcluded.sort((a, b) => a.inflight - b.inflight);
-        const fallback = nonExcluded[0];
-        fallback.inflight = Math.max(0, (fallback.inflight || 0) + 1);
-        fallback.lastUsedAt = now;
-        return fallback;
+        // 6. 兜底选择在途请求最少且不在冷却中的健康账号
+        const available = nonExcluded.filter(a => !a.paused && a.state !== STATUS.AUTH_FAILED && now >= a.disabledUntil);
+        if (available.length > 0) {
+            available.sort((a, b) => a.inflight - b.inflight);
+            const fallback = available[0];
+            fallback.inflight = Math.max(0, (fallback.inflight || 0) + 1);
+            fallback.lastUsedAt = now;
+            return fallback;
+        }
+
+        throw this._noAccountError('当前暂无可用账号可供调度，请在控制台检查账号状态喵');
     }
 
     release(account) {
@@ -360,6 +370,28 @@ class AccountPool {
         acc.okCount++;
     }
 
+    async checkAccountStatusAsync(account) {
+        if (!account || !account.token) return null;
+        try {
+            const BASE = config.DEEPSEEK.BASE;
+            const dsClient = require('./ds-client');
+            const r = await fetch(BASE + '/api/v0/users/current', dsClient.withProxy(account.proxy || '', {
+                headers: {
+                    'authorization': 'Bearer ' + account.token,
+                    'accept': '*/*',
+                    'x-client-platform': 'web',
+                    'x-client-version': '2.5.0',
+                    'x-client-locale': 'en_US',
+                }
+            }));
+            if (!r.ok) return null;
+            const j = await r.json();
+            return (j && j.data && j.data.biz_data) || null;
+        } catch (e) {
+            return null;
+        }
+    }
+
     markFail(account, error, statusCode = 500, bizCode = null) {
         if (!account) return;
         const acc = this._byName(account.name);
@@ -374,114 +406,78 @@ class AccountPool {
             statusCode === 401 ||
             /invalid token|token expired|40003|鉴权失败|未登录/i.test(errMsg);
 
-        // 仅在明确遇到 40003 (或确凿的 Token 过期/失效鉴权错误) 时才熔断并暂停调度
+        // 明确遇到 40003 (或确凿的 Token 过期/失效鉴权错误) 时立即熔断并暂停调度（不再发起无头补登）
         if (isAuthError) {
             acc.state = STATUS.AUTH_FAILED;
             acc.paused = true;
             logger.err(`🚨 账号 ${acc.name} 认证失效 [bizCode=${bizCode}]，已立即熔断并暂停调度！错误: ${errMsg}`);
             this.persistAccountState(acc.name, { paused: true, lastLoginError: errMsg });
-
-            // 若配置了账密且开启 autoLogin，尝试自愈重登
-            if (acc.autoLogin && acc.password && (acc.email || acc.mobile)) {
-                this.triggerAutoRelogin(acc).catch(() => {});
-            }
             return;
         }
 
-        // 官方风控禁言/频控（bizCode=5 等）：只做临时较长退避冷却（如 3 分钟），冷却后自动恢复，绝不暂停调度
+        // 官方风控禁言/冻结/封禁（bizCode=5 等）：抓取状态用于自动冻结到该时间，不再仅做短冷却导致死循环
         const isMutedOrBanned = bizCode === 5 ||
-            /user is muted|account banned|forbidden|被禁言/i.test(errMsg);
+            /user is muted|account banned|forbidden|被禁言|冻结|封禁/i.test(errMsg);
 
         if (isMutedOrBanned) {
-            const muteCooldownMs = 180 * 1000;
-            acc.disabledUntil = Date.now() + muteCooldownMs;
+            // 异步探测官方账号详情，抓取确切的解冻时间或永久封禁状态
+            this.checkAccountStatusAsync(acc).then(bizData => {
+                if (bizData && bizData.chat && bizData.chat.is_muted === 1 && bizData.chat.mute_until) {
+                    const muteUntilMs = Math.round(Number(bizData.chat.mute_until) * 1000);
+                    acc.disabledUntil = muteUntilMs;
+                    acc.frozenUntil = new Date(muteUntilMs).toISOString();
+                    acc.state = STATUS.COOLDOWN;
+                    const msg = `账号被官方暂时冻结至 ${new Date(muteUntilMs).toLocaleString()} (user is muted)`;
+                    acc.lastError = msg;
+                    this.persistAccountState(acc.name, { disabledUntil: muteUntilMs, frozenUntil: acc.frozenUntil, lastLoginError: msg });
+                    logger.warn(`⚠️ 账号 ${acc.name} 触发官方风控冻结，解冻时间: ${new Date(muteUntilMs).toLocaleString()}，已自动冻结至该时间喵！`);
+                } else if (bizData && (bizData.status !== 0 || (bizData.chat && bizData.chat.is_muted === 1 && !bizData.chat.mute_until))) {
+                    acc.state = STATUS.PAUSED;
+                    acc.paused = true;
+                    acc.lastError = '账号已被官方永久封禁';
+                    this.persistAccountState(acc.name, { paused: true, lastLoginError: '账号已被官方永久封禁' });
+                    logger.err(`🚨 账号 ${acc.name} 已被官方永久封禁，已自动暂停调度喵！`);
+                }
+            }).catch(() => {});
+
+            // 同步先设定 1 小时安全退避冻结，防止在此期间被调度循环报错
+            const defaultMuteMs = 3600 * 1000;
+            acc.disabledUntil = Math.max(acc.disabledUntil, Date.now() + defaultMuteMs);
             acc.state = STATUS.COOLDOWN;
-            logger.warn(`⚠️ 账号 ${acc.name} 触发官方风控/频控 [bizCode=${bizCode}]，进入退避冷却 ${Math.round(muteCooldownMs / 1000)}s（冷却后自动恢复，绝不暂停调度）: ${errMsg}`);
+            logger.warn(`⚠️ 账号 ${acc.name} 触发官方风控/频控 [bizCode=${bizCode}]，进入退避冻结（最少 1 小时，后台异步抓取精确解冻时间）: ${errMsg}`);
             return;
         }
 
-        // 网络抖动 / 空响应 / 停滞超时：短暂轻冷却，冷却后自动继续调度，绝不暂停调度
+        // 网络抖动 / 空响应 / 停滞超时：短暂轻冷却
         const isTransient = /上游网络异常|空响应|连接中断|停滞超时|fetch failed|AbortError|UND_ERR|ECONNRESET|ETIMEDOUT/i.test(errMsg)
             || statusCode === 502 || statusCode === 504;
         if (isTransient) {
             const lightMs = Math.min(3000 * Math.pow(1.5, Math.min(acc.failures - 1, 4)), 15000);
             acc.disabledUntil = Date.now() + lightMs;
-            if (acc.state !== STATUS.AUTH_FAILED) {
+            if (acc.state !== STATUS.AUTH_FAILED && !acc.paused) {
                 acc.state = STATUS.COOLDOWN;
             }
-            logger.warn(`账号 ${acc.name} 瞬时网络/上游故障，轻度冷却 ${Math.round(lightMs / 1000)}s（持续可用，不暂停调度）: ${errMsg}`);
+            logger.warn(`账号 ${acc.name} 瞬时网络/上游故障，轻度冷却 ${Math.round(lightMs / 1000)}s: ${errMsg}`);
             return;
         }
 
-        // 普通错误退避冷却：只要没有 40003，无论失败多少次都绝不暂停调度，仅增加冷却时间
+        // 连续故障熔断：任何非瞬时错误若连续失败达到阈值，必须自动熔断暂停调度，彻底杜绝死循环
+        const failLimit = Math.max(1, config.CIRCUIT_BREAKER_FAIL_LIMIT || 3);
+        if (acc.failures >= failLimit) {
+            acc.state = STATUS.PAUSED;
+            acc.paused = true;
+            const pauseMsg = `连续调用失败 ${acc.failures} 次，已自动熔断暂停调度（最后错误: ${errMsg}）`;
+            logger.err(`🚨 账号 ${acc.name} ${pauseMsg}喵！`);
+            this.persistAccountState(acc.name, { paused: true, lastLoginError: pauseMsg });
+            return;
+        }
+
+        // 普通错误退避冷却
         const shift = Math.min(acc.failures - 1, 5);
         const cooldownMs = Math.min(config.COOLDOWN_BASE_MS * Math.pow(2, shift), config.COOLDOWN_MAX_MS);
         acc.disabledUntil = Date.now() + cooldownMs;
         acc.state = STATUS.COOLDOWN;
-        logger.warn(`账号 ${acc.name} 调用异常（第 ${acc.failures} 次），退避冷却 ${Math.round(cooldownMs / 1000)}s（冷却后自动调度，绝不暂停）: ${errMsg}`);
-    }
-
-    async triggerAutoRelogin(account) {
-        logger.info(`正在为账号 ${account.name} 尝试自动重新登录刷新 Token...`);
-        try {
-            const dsLogin = require('./ds-login');
-            const opts = { ...account };
-            if (account.deviceId) opts.deviceId = account.deviceId;
-            const r = await dsLogin.loginAccount(opts);
-            if (r.ok && r.token) {
-                logger.ok(`🎉 账号 ${account.name} 自动重新登录成功，新 Token 已更新，恢复调度！`);
-                const patch = {
-                    token: r.token,
-                    paused: false,
-                    lastLoginAt: new Date().toISOString(),
-                    lastLoginError: '',
-                };
-                if (r.deviceId) patch.deviceId = r.deviceId;
-                this.updateAccount(account.index, patch);
-                return true;
-            } else {
-                const failReason = r.error || '自动重登未成功';
-                logger.err(`账号 ${account.name} 自动重登未成功: ${failReason}`);
-                const failPatch = {
-                    lastLoginError: failReason,
-                    paused: true,
-                };
-                if (r.deviceId) failPatch.deviceId = r.deviceId;
-                this.updateAccount(account.index, failPatch);
-                return false;
-            }
-        } catch (e) {
-            logger.err(`账号 ${account.name} 自动重登异常: ${e.message}`);
-            this.updateAccount(account.index, { lastLoginError: '自动重登异常: ' + e.message, paused: true });
-            return false;
-        }
-    }
-
-    /** 巡检池中所有处于暂停/失效且有账密的账号，主动执行无头重登自愈 */
-    async sweepAndAutoHeal() {
-        if (this._sweeping) return;
-        this._sweeping = true;
-        try {
-            const candidates = this.accounts.filter(a =>
-                !a.disabled &&
-                (a.paused || a.state === STATUS.AUTH_FAILED || !a.token) &&
-                a.autoLogin && a.password && (a.email || a.mobile)
-            );
-            if (!candidates.length) return;
-            logger.info(`🔍 [自愈巡检] 发现 ${candidates.length} 个处于暂停/失效且配置了账密的账号，启动后台无头重登自愈...`);
-            for (const acc of candidates) {
-                // 如果在循环过程中已被其他操作恢复则跳过
-                if (!acc.paused && acc.state !== STATUS.AUTH_FAILED && acc.token) continue;
-                try {
-                    await this.triggerAutoRelogin(acc);
-                    await new Promise(r => setTimeout(r, 2000));
-                } catch (e) {
-                    logger.err(`[自愈巡检] 账号 ${acc.name} 自愈异常: ${e.message}`);
-                }
-            }
-        } finally {
-            this._sweeping = false;
-        }
+        logger.warn(`账号 ${acc.name} 调用异常（第 ${acc.failures} 次），退避冷却 ${Math.round(cooldownMs / 1000)}s: ${errMsg}`);
     }
 
     /**
@@ -523,6 +519,8 @@ class AccountPool {
             proxy: String(accData.proxy || '').trim(),
             disabled: !!accData.disabled,
             paused: false,
+            disabledUntil: accData.disabledUntil ? Number(accData.disabledUntil) : 0,
+            frozenUntil: accData.frozenUntil ? String(accData.frozenUntil) : '',
             lastLoginError: '',
             lastLoginAt: '',
         };
@@ -550,9 +548,11 @@ class AccountPool {
             if (token === 'null' || token === 'undefined') token = '';
             if (token && token !== target.token) {
                 target.token = token;
-                // 更新 Token 时自动解除暂停并清除错误
+                // 更新 Token 时自动解除暂停并清除错误与冻结
                 target.paused = false;
                 target.lastLoginError = '';
+                target.disabledUntil = 0;
+                target.frozenUntil = '';
             } else if (!token && patch.token === '') {
                 target.token = '';
             }
@@ -567,6 +567,8 @@ class AccountPool {
         if (patch.autoLogin !== undefined) target.autoLogin = !!patch.autoLogin;
         if (patch.disabled !== undefined) target.disabled = !!patch.disabled;
         if (patch.paused !== undefined) target.paused = !!patch.paused;
+        if (patch.disabledUntil !== undefined) target.disabledUntil = Number(patch.disabledUntil);
+        if (patch.frozenUntil !== undefined) target.frozenUntil = String(patch.frozenUntil);
         if (patch.lastLoginError !== undefined) target.lastLoginError = String(patch.lastLoginError);
         if (patch.lastLoginAt !== undefined) target.lastLoginAt = String(patch.lastLoginAt);
 
@@ -610,6 +612,7 @@ class AccountPool {
             state: a.state,
             healthy: a.state === STATUS.HEALTHY && now >= a.disabledUntil,
             cooldownSec: Math.max(0, Math.round((a.disabledUntil - now) / 1000)),
+            frozenUntil: a.frozenUntil || '',
             failures: a.failures,
             ok: a.okCount,
             err: a.errCount,
@@ -625,13 +628,16 @@ class AccountPool {
         return this.readRaw().map((a, i) => {
             const name = a.name || ('acc' + (i + 1));
             const p = poolByName.get(name) || this.accounts[i];
+            const disabledUntil = p ? p.disabledUntil : (Number(a.disabledUntil) || 0);
+            const frozenUntil = (p && p.frozenUntil) || a.frozenUntil || (disabledUntil > now ? new Date(disabledUntil).toISOString() : '');
+            const isFrozen = disabledUntil > now;
             return {
                 index: i,
                 name,
                 disabled: !!a.disabled,
                 paused: !!(p ? p.paused : a.paused),
-                state: p ? p.state : (a.disabled ? 'disabled' : (a.paused ? 'paused' : 'healthy')),
-                healthy: p ? (p.state === STATUS.HEALTHY && now >= p.disabledUntil) : !a.disabled,
+                state: p ? p.state : (a.disabled ? 'disabled' : (a.paused ? 'paused' : (isFrozen ? 'cooldown' : 'healthy'))),
+                healthy: p ? (p.state === STATUS.HEALTHY && now >= p.disabledUntil) : (!a.disabled && !a.paused && now >= disabledUntil),
                 hasToken: !!a.token,
                 hasPassword: !!a.password,
                 email: a.email || '',
@@ -640,7 +646,9 @@ class AccountPool {
                 ok: p ? p.okCount : 0,
                 err: p ? p.errCount : 0,
                 inflight: p ? p.inflight : 0,
-                cooldownSec: p ? Math.max(0, Math.round((p.disabledUntil - now) / 1000)) : 0,
+                cooldownSec: p ? Math.max(0, Math.round((p.disabledUntil - now) / 1000)) : (isFrozen ? Math.max(0, Math.round((disabledUntil - now) / 1000)) : 0),
+                frozenUntil,
+                isFrozen,
                 lastError: p ? p.lastError : (a.lastLoginError || ''),
                 lastLoginAt: a.lastLoginAt || '',
                 lastUsedAt: p ? p.lastUsedAt : 0,

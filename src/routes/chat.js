@@ -418,15 +418,9 @@ async function executeWithFailover(opts) {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
         _streamContent = '';
         _streamThinking = '';
-        // 若所有账号都已在前面尝试过，无需再次进入 acquire（允许瞬时重试时不立刻 break）
-        if (excludedAccounts.length >= accountPool.accounts.length && lastError) {
-            const transientStill = lastError && (
-                lastError.statusCode === 502 || lastError.statusCode === 504 ||
-                /上游网络异常|空响应|连接中断|停滞超时|fetch failed/i.test(lastError.message || '')
-            );
-            if (!transientStill) break;
-            // 瞬时故障：清空排除表做最后一轮重试
-            excludedAccounts.length = 0;
+        // 若所有账号都已在前面尝试过，无需再次进入 acquire，直接结束以防死循环
+        if (excludedAccounts.length >= accountPool.accounts.length) {
+            break;
         }
 
         // 会话粘滞账号：已有会话时优先复用原账号（sid/token 必须同账号）

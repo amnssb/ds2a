@@ -539,6 +539,13 @@ async function loadAccounts() {
       let stateTag = '<span class="tag t-ok">健康活跃</span>';
       if (a.state === 'auth_failed') stateTag = '<span class="tag t-err">Token 失效 (熔断)</span>';
       else if (a.paused) stateTag = '<span class="tag t-warn">已暂停调度</span>';
+      else if (a.isFrozen || (a.frozenUntil && new Date(a.frozenUntil).getTime() > Date.now())) {
+          const remainSec = a.cooldownSec || Math.max(0, Math.round((new Date(a.frozenUntil).getTime() - Date.now()) / 1000));
+          const h = Math.floor(remainSec / 3600);
+          const m = Math.floor((remainSec % 3600) / 60);
+          const remainStr = h > 0 ? `${h}h${m}m` : `${remainSec}s`;
+          stateTag = `<span class="tag t-warn" title="官方暂时冻结至 ${esc(a.frozenUntil)}">官方冻结 (余${remainStr})</span>`;
+      }
       else if (a.state === 'cooldown') stateTag = `<span class="tag t-warn">冷却中 (${a.cooldownSec}s)</span>`;
       else if (a.disabled) stateTag = '<span class="tag t-dim">手动停用</span>';
 
@@ -556,7 +563,6 @@ async function loadAccounts() {
         `<td><span style="font-size:11px;color:${a.lastError?'var(--err)':'var(--dim)'}">${esc(a.lastError || '正常运行无异常')}</span></td>` +
         `<td><div class="flex">` +
           `<button class="btn primary btn-test-acc" data-i="${a.index}">连通测试</button>` +
-          (a.hasPassword && (a.email || a.mobile) ? `<button class="btn btn-login-acc" data-i="${a.index}" title="在服务器启动无头浏览器登录并刷新 Token">无头刷新</button>` : '') +
           `<button class="btn btn-tog-acc" data-i="${a.index}" data-p="${!a.paused}">${a.paused?'恢复调度':'暂停'}</button>` +
           `<button class="btn btn-edit-acc" data-i="${a.index}">编辑账号</button>` +
           `<button class="btn danger btn-del-acc" data-i="${a.index}">删除</button>` +
@@ -603,22 +609,6 @@ function bindAccountEvents(accs) {
       loadAccounts();
     }
   });
-
-  document.querySelectorAll('.btn-login-acc').forEach(b => b.onclick = async () => {
-    const idx = b.dataset.i;
-    b.disabled = true;
-    b.textContent = '无头登录中...';
-    try {
-      const res = await api(`/api/accounts/${idx}/login`, { method: 'POST' });
-      toast('🎉 无头重登成功，Token 已更新！', 'ok');
-    } catch(e) {
-      toast('❌ 无头重登未成功: ' + e.message, 'err');
-    } finally {
-      loadAccounts();
-    }
-  });
-
-
 
   document.querySelectorAll('.btn-tog-acc').forEach(b => b.onclick = async () => {
     const idx = b.dataset.i;

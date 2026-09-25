@@ -610,6 +610,114 @@ class BrowserSession {
         }
     }
 
+    /** 抓取账号暂时冻结或永久封禁状态，而不是抓完 token 就断开 */
+    async probeAccountStatus(token) {
+        try {
+            await sleep(1500); // 稍微等待页面完成跳转并初始化
+            const expr = `(async()=>{
+                try {
+                    let tok = ${JSON.stringify(token || '')};
+                    if (!tok) {
+                        try {
+                            const ls = localStorage.getItem("userToken");
+                            const o = JSON.parse(ls);
+                            tok = (o && o.value) ? o.value : ls;
+                        } catch(e) {}
+                    }
+                    const r = await fetch("/api/v0/users/current", {
+                        headers: { "accept": "*/*", "authorization": "Bearer " + tok }
+                    });
+                    const t = await r.text();
+                    return t;
+                } catch(e) { return JSON.stringify({ error: e.message }); }
+            })()`;
+            const text = await this.ev(expr);
+            let j = null;
+            try { j = JSON.parse(text); } catch (e) {}
+
+            // 检查网页 DOM 中是否有弹窗提示封禁/冻结/违规
+            const domNotice = await this.ev(`(function(){
+                try {
+                    const el = document.querySelector('.ds-modal, [role="dialog"], [class*="modal"], [class*="dialog"], .ant-modal, .el-dialog');
+                    if (el) {
+                        const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+                        if (/冻结|封禁|违规|muted|banned|suspended|限制/i.test(t)) return t.slice(0, 300);
+                    }
+                    const bodyText = (document.body && document.body.innerText) || '';
+                    const m = bodyText.match(/(?:账号已被?(?:暂时)?冻结(?:至|，解冻时间[：:])?\\s*[^\\n\\r]+|账号已被?永久封禁|因违规已被限制使用[^\\n\\r]*)/);
+                    return m ? m[0] : '';
+                } catch(e) { return ''; }
+            })()`);
+
+            const data = (j && j.data && j.data.biz_data) || {};
+            const chat = data.chat || {};
+
+            // 1. 暂时冻结
+            if (chat.is_muted === 1 && chat.mute_until) {
+                const muteUntilMs = Math.round(Number(chat.mute_until) * 1000);
+                const frozenUntil = new Date(muteUntilMs).toISOString();
+                const friendly = new Date(muteUntilMs).toLocaleString();
+                return {
+                    frozen: true,
+                    banned: false,
+                    muteUntil: muteUntilMs,
+                    frozenUntil,
+                    statusMsg: `账号被官方暂时冻结至 ${friendly} (解冻前暂停调度)`,
+                    domNotice,
+                    user: data,
+                };
+            }
+
+            // 2. 永久封禁
+            const isPermanent = data.status !== 0 ||
+                (chat.is_muted === 1 && !chat.mute_until) ||
+                (domNotice && /永久封禁|永久限制|严重违规/i.test(domNotice));
+            if (isPermanent) {
+                return {
+                    frozen: false,
+                    banned: true,
+                    statusMsg: domNotice || '账号已被官方永久封禁',
+                    domNotice,
+                    user: data,
+                };
+            }
+
+            return {
+                frozen: false,
+                banned: false,
+                statusMsg: '账号状态正常',
+                user: data,
+            };
+        } catch (e) {
+            return { frozen: false, banned: false, error: e.message };
+        }
+    }
+
+    async wrapTokenResult(tok, did, from) {
+        console.log(`[ds-login] 正在核查账号风控/冻结/封禁状态，绝不草率断开...`);
+        const st = await this.probeAccountStatus(tok);
+        const res = {
+            ok: true,
+            token: tok,
+            deviceId: did,
+            from: from || 'api',
+            frozen: st.frozen,
+            banned: st.banned,
+            muteUntil: st.muteUntil,
+            frozenUntil: st.frozenUntil,
+            statusMsg: st.statusMsg,
+            user: st.user,
+        };
+        if (st.frozen) {
+            console.log(`[ds-login] ⚠️ 账号抓到 Token，但已被官方暂时冻结至 ${st.frozenUntil}！已记录精确冻结时间。`);
+        } else if (st.banned) {
+            console.log(`[ds-login] 🚨 账号抓到 Token，但已被官方永久封禁: ${st.statusMsg}！已标记封禁。`);
+        } else {
+            console.log(`[ds-login] ✅ 账号状态正常且 Token 就绪！`);
+        }
+        return res;
+    }
+
     async login(o) {
         let did = String(o.deviceId || deviceIdFor(seedOf(o)));
         const body = buildBody(o, did);
@@ -630,7 +738,7 @@ class BrowserSession {
             while (Date.now() - t0 < wafTimeout) {
                 const tok = await this.readUserToken();
                 if (tok && tok.length > 20) {
-                    return { ok: true, token: tok, deviceId: did, from: 'manual-headful' };
+                    return await this.wrapTokenResult(tok, did, 'manual-headful');
                 }
 
                 // 验证元素检测：提示人工处理，绝不自动退出、绝不打断
@@ -657,7 +765,7 @@ class BrowserSession {
                     // 验证期间绝不重复提交打扰人工操作
                     const tok2 = await this.readUserToken();
                     if (tok2 && tok2.length > 20) {
-                        return { ok: true, token: tok2, deviceId: did, from: 'form-headful' };
+                        return await this.wrapTokenResult(tok2, did, 'form-headful');
                     }
                     if (!verify && await this.signInFormVisible(!!o.email)) {
                         await this.fillAndSubmitLogin(o);
@@ -674,7 +782,7 @@ class BrowserSession {
             }
             const tokEnd = await this.readUserToken();
             if (tokEnd && tokEnd.length > 20) {
-                return { ok: true, token: tokEnd, deviceId: did, from: 'manual-headful' };
+                return await this.wrapTokenResult(tokEnd, did, 'manual-headful');
             }
             // 有头超时：仍带上下文返回，便于上层提示人工登录
             return { ok: false, waf: true, deviceId: did, error: '有头登录等待超时：未拿到 userToken（可在窗口完成验证码/手动登录后重试）' };
@@ -744,8 +852,7 @@ class BrowserSession {
                     }
                     const finalTok = normalizeToken(out.token);
                     if (finalTok) {
-                        out.token = finalTok;
-                        return out;
+                        return await this.wrapTokenResult(finalTok, did, 'api-login');
                     }
                     out.ok = false;
                     out.error = '登录响应未拿到有效 userToken（可能是壳数据）';
@@ -753,7 +860,7 @@ class BrowserSession {
                 if (!out.ok) {
                     const manual = await this.readUserToken();
                     if (manual && manual.length > 20) {
-                        return { ok: true, token: manual, deviceId: did, from: 'manual-after-login' };
+                        return await this.wrapTokenResult(manual, did, 'manual-after-login');
                     }
                 }
                 return out;
