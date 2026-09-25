@@ -288,19 +288,25 @@ async function requestJson(token, method, urlPath, body, timeoutMs = 60000, prox
 /**
  * 获取一个可用的 PoW Header。
  * 每一个请求必须独占一个 PoW，绝不可多请求共享（否则 DS 校验会报一次性 Token 重复使用错误）。
+ * @param {string} token
+ * @param {string} targetPath
+ * @param {string} proxy
+ * @param {boolean} forceFresh - 强制跳过预热缓存，现场向官方申请并求解最新 PoW
  */
-async function getPowHeader(token, targetPath, proxy = '') {
+async function getPowHeader(token, targetPath, proxy = '', forceFresh = false) {
     const cacheKey = powCacheKey(token, proxy);
-    // 1. 尝试从预热池获取已预计算好的 PoW（0ms 放行）
-    const cached = powEngine.powPool.get(cacheKey, targetPath);
-    if (cached) {
-        logger.pow(`⚡ [PoW Hit] 命中预热缓存，0ms 放行！path=${targetPath}`);
-        // 消费一个即在后台异步补充一个，保持池满
-        prewarmPoW(token, targetPath, proxy).catch(() => {});
-        return cached;
+    // 1. 若非强制新鲜，尝试从预热池获取已预计算好的 PoW（0ms 放行）
+    if (!forceFresh) {
+        const cached = powEngine.powPool.get(cacheKey, targetPath);
+        if (cached) {
+            logger.pow(`⚡ [PoW Hit] 命中预热缓存，0ms 放行！path=${targetPath}`);
+            // 消费一个即在后台异步补充一个，保持池满
+            prewarmPoW(token, targetPath, proxy).catch(() => {});
+            return cached;
+        }
     }
 
-    // 2. 无预热缓存时实时求解（单次独占）
+    // 2. 无预热缓存或强制现场求解（单次独占）
     const outer = await requestJson(token, 'POST', config.DEEPSEEK.POW_CHALLENGE, { target_path: targetPath }, 30000, proxy);
     const ch = (outer && outer.challenge) ? outer.challenge : outer;
     if (!ch || !ch.challenge) {
@@ -314,7 +320,7 @@ async function getPowHeader(token, targetPath, proxy = '') {
     }
 
     const header = powEngine.buildHeader(ch, answer, targetPath);
-    logger.pow(`[PoW Solved] target=${targetPath} answer=${answer} 耗时=${Date.now() - t0}ms`);
+    logger.pow(`[PoW Solved] target=${targetPath} answer=${answer} 耗时=${Date.now() - t0}ms${forceFresh ? ' (现场强制全新求解)' : ''}`);
 
     // 实时求解后，立即触发下一个预热，加速后续调用
     prewarmPoW(token, targetPath, proxy).catch(() => {});
@@ -340,7 +346,13 @@ async function prewarmPoW(token, targetPath = TARGET_COMPLETION, proxy = '') {
         const answer = await powEngine.solve(ch);
         if (answer >= 0) {
             const header = powEngine.buildHeader(ch, answer, targetPath);
-            const expireAt = ch.expire_at ? Number(ch.expire_at) * 1000 : (Date.now() + 300000);
+            let expireAt;
+            if (ch.expire_at) {
+                const v = Number(ch.expire_at);
+                expireAt = v > 1e11 ? v : v * 1000;
+            } else {
+                expireAt = Date.now() + 300000;
+            }
             pool.put(cacheKey, targetPath, header, expireAt);
             logger.pow(`PoW 预热成功 [...${token.slice(-6)}] 池: ${pool.size(cacheKey, targetPath)}/${powEngine.POW_POOL_MAX}`);
         }
@@ -477,54 +489,70 @@ async function completion(opts) {
     resetStall();
 
     try {
-        const extraHeaders = {
-            'content-type': 'application/json',
-            'x-ds-pow-response': pow,
-        };
-        if (thinkingEnabled) extraHeaders['x-thinking-enabled'] = '1';
+        let currentPow = pow;
+        let r = null;
+        let powRetried = false;
 
-        let r;
-        try {
-            r = await fetch(BASE + TARGET_COMPLETION, withProxy(proxy, {
+        const doFetch = async (powHeader) => {
+            const extraHeaders = {
+                'content-type': 'application/json',
+                'x-ds-pow-response': powHeader,
+            };
+            if (thinkingEnabled) extraHeaders['x-thinking-enabled'] = '1';
+            return fetch(BASE + TARGET_COMPLETION, withProxy(proxy, {
                 method: 'POST',
                 headers: headersFor(token, extraHeaders),
                 body: JSON.stringify(body),
                 signal: ac.signal,
             }));
-        } catch (e) {
-            const msg = String(e && e.message || e);
-            if (stalled) {
-                throw new DeepSeekApiError(`上游流式响应停滞超时 (${Math.round(stallBudget / 1000)}s)`, 504, null, TARGET_COMPLETION);
-            }
-            if (userAborted) {
-                throw new DeepSeekApiError('客户端已中断请求', 499, null, TARGET_COMPLETION);
-            }
-            if (/abort|fetch failed|network|ECONNRESET|ETIMEDOUT|UND_ERR/i.test(msg)) {
-                throw new DeepSeekApiError(`上游网络异常: ${msg}`, 502, null, TARGET_COMPLETION);
-            }
-            throw e;
-        }
+        };
 
-        if (!r.ok) {
-            const t = await r.text().catch(() => '');
-            let j = null;
-            try { j = JSON.parse(t); } catch (e) {}
-            const bizCode = j && (j.data && j.data.biz_code != null ? j.data.biz_code : j.code);
-            throw new DeepSeekApiError(`对话 HTTP ${r.status}: ${t.slice(0, 200)}`, r.status, bizCode, TARGET_COMPLETION);
-        }
-
-        // 检查 Content-Type：若上游返回 application/json，说明发生业务拦截（如 user is muted，biz_code=5）
-        const contentType = String(r.headers.get('content-type') || '').toLowerCase();
-        if (contentType.includes('application/json')) {
-            const t = await r.text().catch(() => '');
-            let j = null;
-            try { j = JSON.parse(t); } catch (e) {}
-            if (j) {
-                const bizCode = (j.data && j.data.biz_code != null) ? j.data.biz_code : j.code;
-                const bizMsg = (j.data && j.data.biz_msg) || j.msg || JSON.stringify(j);
-                throw new DeepSeekApiError(`DeepSeek 业务拦截 [bizCode=${bizCode}]: ${bizMsg}`, 403, bizCode, TARGET_COMPLETION);
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+                r = await doFetch(currentPow);
+            } catch (e) {
+                const msg = String(e && e.message || e);
+                if (stalled) {
+                    throw new DeepSeekApiError(`上游流式响应停滞超时 (${Math.round(stallBudget / 1000)}s)`, 504, null, TARGET_COMPLETION);
+                }
+                if (userAborted) {
+                    throw new DeepSeekApiError('客户端已中断请求', 499, null, TARGET_COMPLETION);
+                }
+                if (/abort|fetch failed|network|ECONNRESET|ETIMEDOUT|UND_ERR/i.test(msg)) {
+                    throw new DeepSeekApiError(`上游网络异常: ${msg}`, 502, null, TARGET_COMPLETION);
+                }
+                throw e;
             }
-            throw new DeepSeekApiError(`对话非流式响应: ${t.slice(0, 200)}`, 502, null, TARGET_COMPLETION);
+
+            const contentType = String(r.headers.get('content-type') || '').toLowerCase();
+            const isJsonIntercept = !r.ok || contentType.includes('application/json');
+
+            if (isJsonIntercept) {
+                const t = await r.text().catch(() => '');
+                let j = null;
+                try { j = JSON.parse(t); } catch (e) {}
+                const bizCode = j && (j.data && j.data.biz_code != null ? j.data.biz_code : j.code);
+                const bizMsg = (j && ((j.data && j.data.biz_msg) || j.msg)) || (r.ok ? JSON.stringify(j) : t.slice(0, 200));
+
+                const isPowError = bizCode === 40301 || /INVALID_POW_RESPONSE/i.test(bizMsg || '');
+                if (isPowError && !powRetried) {
+                    powRetried = true;
+                    logger.warn('检测到 PoW 失效 [40301 INVALID_POW_RESPONSE]，正在清空预热池并现场重新求解 PoW 自动自愈重试...');
+                    powEngine.powPool.clear(powCacheKey(token, proxy));
+                    currentPow = await getPowHeader(token, TARGET_COMPLETION, proxy, true);
+                    continue;
+                }
+
+                if (!r.ok) {
+                    throw new DeepSeekApiError(`对话 HTTP ${r.status}: ${bizMsg}`, r.status, bizCode, TARGET_COMPLETION);
+                }
+                if (j) {
+                    throw new DeepSeekApiError(`DeepSeek 业务拦截 [bizCode=${bizCode}]: ${bizMsg}`, 403, bizCode, TARGET_COMPLETION);
+                }
+                throw new DeepSeekApiError(`对话非流式响应: ${t.slice(0, 200)}`, 502, null, TARGET_COMPLETION);
+            }
+
+            break;
         }
 
         const reader = r.body.getReader();

@@ -323,9 +323,11 @@ function buildHeader(ch, answer, targetPath) {
 // 4. 滚动预热池（每账号最多缓存 POW_POOL_MAX 个已解 PoW，消费一个立即异步补充一个）
 const POW_POOL_MAX = 2; // 每账号目标预热储备数量，可按需调大
 
+const POW_MAX_LIFETIME = 180000; // 最多存活 3 分钟，防止服务端提前失效
+
 class PowPool {
     constructor() {
-        // token -> Array<{ header, expireAt, targetPath }>
+        // token -> Array<{ header, expireAt, targetPath, createdAt }>
         this.cache = new Map();
         // "token_tail|path" -> 正在飞行的预热请求数（用于"已有+在途 >= 目标"的原子判断）
         this.inflight = new Map();
@@ -340,7 +342,10 @@ class PowPool {
         const now = Date.now();
         for (let i = 0; i < list.length; i++) {
             const item = list[i];
-            if (item.targetPath === targetPath && item.expireAt - 30000 > now) {
+            const fresh = item.targetPath === targetPath &&
+                          (item.expireAt - 60000 > now) &&
+                          (now - item.createdAt <= POW_MAX_LIFETIME);
+            if (fresh) {
                 list.splice(i, 1);
                 if (!list.length) this.cache.delete(token);
                 return item.header;
@@ -356,9 +361,12 @@ class PowPool {
         const now = Date.now();
         // 顺手清理过期条目
         for (let i = list.length - 1; i >= 0; i--) {
-            if (list[i].expireAt - 30000 <= now) list.splice(i, 1);
+            const it = list[i];
+            if (it.expireAt - 60000 <= now || (now - it.createdAt > POW_MAX_LIFETIME)) {
+                list.splice(i, 1);
+            }
         }
-        list.push({ header, expireAt, targetPath });
+        list.push({ header, expireAt, targetPath, createdAt: now });
     }
 
     /** 当前有效缓存数量 */
@@ -366,7 +374,11 @@ class PowPool {
         const list = this.cache.get(token);
         if (!list) return 0;
         const now = Date.now();
-        return list.filter(item => item.targetPath === targetPath && item.expireAt - 30000 > now).length;
+        return list.filter(item =>
+            item.targetPath === targetPath &&
+            (item.expireAt - 60000 > now) &&
+            (now - item.createdAt <= POW_MAX_LIFETIME)
+        ).length;
     }
 
     // --- 在途计数（JS 单线程，check+increment 是原子的，不会竞争） ---

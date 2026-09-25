@@ -559,7 +559,8 @@ async function executeWithFailover(opts) {
             const bizCode = err.bizCode || (err.message && err.message.match(/code=(\d+)/) ? Number(err.message.match(/code=(\d+)/)[1]) : null);
             // 客户端主动取消不惩罚账号
             const clientCancel = err && (err.statusCode === 499 || /客户端已中断/i.test(err.message || ''));
-            if (!clientCancel) {
+            const isPowError = bizCode === 40301 || /INVALID_POW_RESPONSE/i.test(err.message || '');
+            if (!clientCancel && !isPowError) {
                 accountPool.markFail(account, err, err.statusCode || 500, bizCode);
             }
             // 流式已出口：重试必然造成重复拼接，直接把错误抛给端点收尾，不再 Failover
@@ -568,9 +569,9 @@ async function executeWithFailover(opts) {
                 err.triedAccounts = triedAccounts;
                 throw err;
             }
-            // 瞬时网络/空响应：不立刻排除账号，允许同一请求内快速重试一次
+            // 瞬时网络/空响应/PoW凭证抖动：不立刻排除账号，允许同一请求内快速重试一次
             const transient = !clientCancel && (
-                err.statusCode === 502 || err.statusCode === 504 ||
+                err.statusCode === 502 || err.statusCode === 504 || isPowError ||
                 /上游网络异常|空响应|连接中断|停滞超时|fetch failed/i.test(err.message || '')
             );
             if (!transient) {
