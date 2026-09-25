@@ -408,11 +408,11 @@
     <h3>DeepSeek 网关管理员登录</h3>
     <div class="field">
       <label>用户名</label>
-      <input id="l-user" value="admin" autocomplete="username">
+      <input id="l-user" value="admin" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-form-fill-ignore>
     </div>
     <div class="field">
       <label>密码</label>
-      <input id="l-pass" type="password" value="admin123" autocomplete="current-password">
+      <input id="l-pass" type="password" value="admin123" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-form-fill-ignore>
     </div>
     <div id="l-err" style="color:var(--err);font-size:12px;margin-bottom:10px;display:none"></div>
     <div class="flex" style="justify-content:flex-end">
@@ -518,7 +518,7 @@ async function loadDash() {
 
   $('errors').innerHTML = (d.errors && d.errors.length) ? d.errors.map(e => `
     <div style="background:var(--panel2);border-left:3px solid var(--err);padding:10px 14px;margin-bottom:8px;border-radius:4px">
-      <b>${fmtTime(e.at)}</b> <code>${esc(e.endpoint)}</code><br>
+      <b>${fmtTime(e.at)}</b> <code>${esc(e.endpoint)}</code> ${e.account && e.account !== 'unknown' ? `<span class="tag t-warn" style="margin-left:6px">账号: <b>${esc(e.account)}</b></span>` : ''}<br>
       <span style="color:var(--err)">${esc(e.error)}</span>
     </div>
   `).join('') : '<div class="empty">无异常记录 🎉</div>';
@@ -579,13 +579,13 @@ function bindAccountEvents(accs) {
     try {
       const d = await api('/api/accounts?reveal=1');
       const a = (d.accounts || []).find(x => String(x.index) === c.dataset.i);
-      if (!a || !a.token) { alert('该账号没有 Token'); return; }
+      if (!a || !a.token) { toast('该账号没有 Token', 'warn'); return; }
       await navigator.clipboard.writeText(a.token);
       const old = c.textContent;
       c.textContent = '已复制';
       setTimeout(() => c.textContent = old, 800);
     } catch(e) {
-      alert('复制失败: ' + e.message);
+      toast('复制失败: ' + e.message, 'err');
     }
   });
 
@@ -595,9 +595,9 @@ function bindAccountEvents(accs) {
     b.textContent = '探测中...';
     try {
       const res = await api(`/api/accounts/${idx}/test`, { method: 'POST' });
-      alert(res.message || '探测成功，Token 有效！');
+      toast(res.message || '探测成功，Token 有效！', 'ok');
     } catch(e) {
-      alert('探测失败: ' + e.message);
+      toast('探测失败: ' + e.message, 'err');
     } finally {
       loadAccounts();
     }
@@ -611,7 +611,7 @@ function bindAccountEvents(accs) {
     try {
       await api(`/api/accounts/${idx}/${shouldPause ? 'pause' : 'resume'}`, { method: 'POST' });
       loadAccounts();
-    } catch(e) { alert('操作失败: ' + e.message); }
+    } catch(e) { toast('操作失败: ' + e.message, 'err'); }
   });
 
   document.querySelectorAll('.btn-edit-acc').forEach(b => b.onclick = async () => {
@@ -623,7 +623,7 @@ function bindAccountEvents(accs) {
       a = (d.accounts || []).find(x => String(x.index) === idx);
       if (!a) throw new Error('账号不存在');
     } catch(e) {
-      alert('读取账号失败: ' + e.message);
+      toast('读取账号失败: ' + e.message, 'err');
       return;
     }
     openModal('编辑账号 ' + a.name, [
@@ -645,11 +645,11 @@ function bindAccountEvents(accs) {
   });
 
   document.querySelectorAll('.btn-del-acc').forEach(b => b.onclick = async () => {
-    if (!confirm('确定删除该账号？')) return;
+    if (!(await confirmBox('确定删除该账号？'))) return;
     try {
       await api('/api/accounts/' + b.dataset.i, { method: 'DELETE' });
       loadAccounts();
-    } catch(e) { alert('删除失败: ' + e.message); }
+    } catch(e) { toast('删除失败: ' + e.message, 'err'); }
   });
 }
 
@@ -658,16 +658,16 @@ $('btn-reload-accs').onclick = async () => {
   try {
     await api('/api/accounts/reload', { method: 'POST' });
     loadAccounts();
-  } catch(e) { alert('重新载入失败: ' + e.message); }
+  } catch(e) { toast('重新载入失败: ' + e.message, 'err'); }
 };
 
 const batchProxyBtn = $('btn-batch-proxy');
 if (batchProxyBtn) {
   batchProxyBtn.onclick = async () => {
     let d;
-    try { d = await api('/api/accounts'); } catch(e) { return alert('获取账号失败: ' + e.message); }
+    try { d = await api('/api/accounts'); } catch(e) { return toast('获取账号失败: ' + e.message, 'err'); }
     const accs = d.accounts || [];
-    if (!accs.length) return alert('当前没有账号可分配代理');
+    if (!accs.length) return toast('当前没有账号可分配代理', 'warn');
     openModal('⚡ 批量分配账号代理池（每行一个）', [
       ['代理列表（支持 HTTP/HTTPS/SOCKS5，每行一个）', 'proxies', 'textarea', 'http://127.0.0.1:7890\nsocks5://127.0.0.1:10808'],
     ], async val => {
@@ -682,7 +682,7 @@ if (batchProxyBtn) {
         });
         updated++;
       }
-      alert('成功为 ' + updated + ' 个账号轮询分配独立代理！');
+      toast('成功为 ' + updated + ' 个账号轮询分配独立代理！', 'ok');
       loadAccounts();
     });
   };
@@ -727,14 +727,14 @@ async function loadKeys() {
     try {
       await api('/api/keys/' + b.dataset.kid, { method: 'PATCH', body: JSON.stringify({ enabled: b.dataset.en === 'true' }) });
       loadKeys();
-    } catch(e) { alert('操作失败: ' + e.message); }
+    } catch(e) { toast('操作失败: ' + e.message, 'err'); }
   });
   document.querySelectorAll('.btn-del-key').forEach(b => b.onclick = async () => {
-    if (!confirm('确定删除该 Key？')) return;
+    if (!(await confirmBox('确定删除该 Key？'))) return;
     try {
       await api('/api/keys/' + b.dataset.kid, { method: 'DELETE' });
       loadKeys();
-    } catch(e) { alert('删除失败: ' + e.message); }
+    } catch(e) { toast('删除失败: ' + e.message, 'err'); }
   });
 }
 
@@ -746,7 +746,7 @@ $('btn-newkey').onclick = () => openModal('创建 API Key', [
   const fullKey = r.key && r.key.key;
   if (!fullKey) throw new Error('创建成功但未返回 Key');
   try { await navigator.clipboard.writeText(fullKey); } catch(e) {}
-  alert('API Key 创建成功！完整 Key 已尝试复制到剪贴板，请妥善保存：\n\n' + fullKey);
+  showInfoModal('API Key 创建成功', '完整 Key 已尝试复制到剪贴板，请妥善保存：<br><code style="user-select:all">' + esc(fullKey) + '</code>');
   loadKeys();
 });
 
@@ -807,11 +807,11 @@ async function loadUsage() {
     `).join('') + '</tbody></table>' : '<div class="empty">暂无历史日期统计</div>';
 }
 $('btn-reset-usage').onclick = async () => {
-  if (!confirm('确定重置所有 Token 统计数据？')) return;
+  if (!(await confirmBox('确定重置所有 Token 统计数据？'))) return;
   try {
     await api('/api/usage/reset', { method: 'POST' });
     loadUsage();
-  } catch(e) { alert('重置失败: ' + e.message); }
+  } catch(e) { toast('重置失败: ' + e.message, 'err'); }
 };
 
 // 5. 文件上传
@@ -860,9 +860,9 @@ async function doUpload(files) {
     try {
       const r = await fetch('/v1/files', { method: 'POST', body: fd });
       const j = await r.json();
-      if (!r.ok) alert('上传失败: ' + (j.error || '未知错误'));
+      if (!r.ok) toast('上传失败: ' + (j.error || '未知错误'), 'err');
     } catch(e) {
-      alert('上传异常: ' + e.message);
+      toast('上传异常: ' + e.message, 'err');
     }
   }
   loadUploads();
@@ -890,13 +890,13 @@ async function loadSessions() {
     `).join('') + '</tbody></table>' : '<div class="empty">当前无保持中的活跃会话</div>';
 
   document.querySelectorAll('.btn-del-sess').forEach(b => b.onclick = async () => {
-    if (!confirm('确定释放该会话并清理 DeepSeek 远端对话？')) return;
+    if (!(await confirmBox('确定释放该会话并清理 DeepSeek 远端对话？'))) return;
     await api('/v1/session/' + encodeURIComponent(b.dataset.k), { method: 'DELETE' });
     loadSessions();
   });
 }
 $('btn-clean-sess').onclick = async () => {
-  alert('系统每 15 秒会自动扫描释放闲置会话喵。');
+  toast('系统每 15 秒会自动扫描释放闲置会话喵。', 'info');
   loadSessions();
 };
 
@@ -939,7 +939,7 @@ function openModal(title, fields, onSubmit) {
       ${fields.map(f => `
         <div class="field">
           <label>${esc(f[0])}</label>
-          ${f[2] === 'textarea' ? `<textarea id="m-${f[1]}" rows="3">${esc(f[3]||'')}</textarea>` : `<input id="m-${f[1]}" type="${f[2]||'text'}" value="${esc(f[3]||'')}">`}
+          ${f[2] === 'textarea' ? `<textarea id="m-${f[1]}" rows="3" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-bwignore="true">${esc(f[3]||'')}</textarea>` : `<input id="m-${f[1]}" type="${f[2]||'text'}" value="${esc(f[3]||'')}" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" ${f[2]==='password'?'data-form-fill-ignore':''}>`}
         </div>
       `).join('')}
       <div class="flex" style="justify-content:flex-end">
@@ -960,9 +960,67 @@ function openModal(title, fields, onSubmit) {
       await onSubmit(val);
       el.remove();
     } catch(e) {
-      alert('操作失败: ' + e.message);
+      toast('操作失败: ' + e.message, 'err');
     }
   };
+}
+
+// ---------- Toast 与自定义确认框（替代系统 alert/confirm 弹窗） ----------
+function toast(msg, type) {
+  type = type || 'info';
+  let wrap = document.getElementById('toastWrap');
+  if (!wrap) {
+    wrap = document.createElement('div');
+    wrap.id = 'toastWrap';
+    wrap.style.cssText = 'position:fixed;right:18px;bottom:18px;z-index:9999;display:flex;flex-direction:column;gap:8px;max-width:420px';
+    document.body.appendChild(wrap);
+  }
+  const el = document.createElement('div');
+  const colors = { info: '#1d4ed8', ok: '#065f46', err: '#991b1b', warn: '#92400e' };
+  el.style.cssText = 'background:' + (colors[type] || colors.info) + ';color:#fff;padding:10px 14px;border-radius:8px;font-size:13px;box-shadow:0 8px 24px rgba(0,0,0,.45);opacity:0;transform:translateY(8px);transition:all .25s;word-break:break-all';
+  el.textContent = msg;
+  wrap.appendChild(el);
+  requestAnimationFrame(() => { el.style.opacity = '1'; el.style.transform = 'none'; });
+  setTimeout(() => {
+    el.style.opacity = '0'; el.style.transform = 'translateY(8px)';
+    setTimeout(() => el.remove(), 300);
+  }, type === 'err' ? 6000 : 3200);
+}
+
+function confirmBox(msg) {
+  return new Promise(resolve => {
+    const el = document.createElement('div');
+    el.className = 'modal';
+    el.style.zIndex = '10000';
+    el.innerHTML = `
+      <div class="box">
+        <h3>确认操作</h3>
+        <div style="margin-bottom:14px;font-size:13px">${esc(msg)}</div>
+        <div class="flex" style="justify-content:flex-end">
+          <button class="btn cancel">取消</button>
+          <button class="btn primary ok">确认</button>
+        </div>
+      </div>`;
+    document.body.appendChild(el);
+    el.querySelector('.cancel').onclick = () => { el.remove(); resolve(false); };
+    el.querySelector('.ok').onclick = () => { el.remove(); resolve(true); };
+  });
+}
+
+function showInfoModal(title, bodyHtml) {
+  const el = document.createElement('div');
+  el.className = 'modal';
+  el.style.zIndex = '10000';
+  el.innerHTML = `
+    <div class="box">
+      <h3>${esc(title)}</h3>
+      <div style="margin-bottom:14px;font-size:13px;word-break:break-all">${bodyHtml}</div>
+      <div class="flex" style="justify-content:flex-end">
+        <button class="btn primary ok">好的</button>
+      </div>
+    </div>`;
+  document.body.appendChild(el);
+  el.querySelector('.ok').onclick = () => el.remove();
 }
 
 // ---------- 认证控制 ----------
@@ -974,7 +1032,7 @@ $('l-sub').onclick = async () => {
     const r = await api('/api/login', { method: 'POST', body: JSON.stringify({ username: u, password: p }) });
     hideLogin();
     if (r.mustChangePassword) {
-      alert('检测到仍在使用初始密码，请立即修改管理员密码喵。');
+      toast('检测到仍在使用初始密码，请立即修改管理员密码喵。', 'warn');
       openForceChangePassword();
       return;
     }
@@ -1000,7 +1058,7 @@ function openForceChangePassword() {
       oldPassword: v.oldPassword,
       newPassword: v.newPassword,
     })});
-    alert('密码修改成功，正在进入控制台喵！');
+    toast('密码修改成功，正在进入控制台喵！', 'ok');
     boot();
   });
 }
@@ -1011,12 +1069,12 @@ $('btn-chpw').onclick = () => openModal('修改管理员密码', [
   ['重复新密码', 'confirmPassword', 'password'],
 ], async v => {
   if (v.newPassword !== v.confirmPassword) throw new Error('两次新密码不一致');
-  await api('/api/change-password', { method: 'POST', body: JSON.stringify({
-    oldPassword: v.oldPassword,
-    newPassword: v.newPassword,
-  })});
-  alert('密码修改成功，请牢记新密码！');
-});
+    await api('/api/change-password', { method: 'POST', body: JSON.stringify({
+      oldPassword: v.oldPassword,
+      newPassword: v.newPassword,
+    })});
+    toast('密码修改成功，请牢记新密码！', 'ok');
+  });
 $('btn-refresh').onclick = () => {
   const activeNav = document.querySelector('nav button.on');
   if (activeNav) loadTab(activeNav.dataset.tab);

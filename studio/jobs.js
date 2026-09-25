@@ -62,6 +62,9 @@ async function runTokenJob(opts) {
 
     (async () => {
         const items = [];
+        if (o.headful) {
+            push('有头模式：浏览器窗口将打开，如出现验证码请在窗口手动完成，脚本会持续等待（不会自动关闭窗口）喵');
+        }
         for (const acc of targets) {
             job.current = acc.name;
             if (!acc.password || (!acc.email && !acc.mobile)) {
@@ -81,9 +84,8 @@ async function runTokenJob(opts) {
                     deviceId: acc.deviceId || '',
                     name: acc.name,
                     profileTag: acc.name,
-                    proxy: acc.proxy || '',
+                    // 登录流程不走代理（直连），账号代理仅用于服务端 API 对话
                     timeoutMs: 45000,
-                    wafTimeoutMs: Number(process.env.DS_WAF_TIMEOUT_MS || 90000),
                     loginRetries: 8,
                 });
                 if (r.ok && r.token) {
@@ -92,7 +94,6 @@ async function runTokenJob(opts) {
                         name: acc.name,
                         token: r.token,
                         deviceId: r.deviceId || acc.deviceId || '',
-                        proxy: acc.proxy || '',
                         lastLoginAt: at,
                         lastLoginError: '',
                     });
@@ -102,7 +103,7 @@ async function runTokenJob(opts) {
                 } else {
                     job.fail++;
                     const err = r.error || '登录失败';
-                    store.upsertAccount({ name: acc.name, lastLoginError: err, deviceId: r.deviceId || '', proxy: acc.proxy || '' });
+                    store.upsertAccount({ name: acc.name, lastLoginError: err, deviceId: r.deviceId || '' });
                     push('FAIL ' + acc.name + ': ' + err);
                     items.push({ name: acc.name, ok: false, error: err });
                 }

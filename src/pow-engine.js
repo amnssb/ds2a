@@ -2,11 +2,12 @@
 /**
  * src/pow-engine.js — 高性能 PoW 求解器与预热引擎
  * - 支持官方 sha3_wasm_bg.wasm 硬件级加速（计算耗时由 3500ms 降至 85ms，提速 40x）
- * - 纯 JS 容灾回退（零依赖兜底）
+ * - 纯 JS 容灾回退（零依赖兜底，运行于 worker 线程，不阻塞事件循环）
  * - PoW 异步预热池（命中预热时 0ms 延迟直接放行）
  */
 const fs = require('fs');
 const path = require('path');
+const { Worker } = require('worker_threads');
 const config = require('./config');
 const logger = require('./logger');
 
@@ -33,23 +34,35 @@ try {
 }
 
 // 2. WASM 求解函数
+/** 释放 wasm-bindgen 分配器给出的内存，防止线性内存随请求数持续增长 */
+function wasmFree(ptr, len) {
+    try {
+        if (wasmExports && typeof wasmExports.__wbindgen_free === 'function' && ptr) {
+            wasmExports.__wbindgen_free(ptr, len, 1);
+        }
+    } catch (e) {}
+}
+
 function solveByWasm(prefix, challengeHex, difficulty) {
     if (!wasmAvailable || !wasmExports) return -1;
 
+    let pCh = 0;
+    let pPre = 0;
+    let retptr = 0;
     try {
         const wasm = wasmExports;
         // 分配 challenge 字符串内存
         const bCh = Buffer.from(challengeHex, 'utf8');
-        const pCh = wasm.__wbindgen_export_0(bCh.length, 1);
+        pCh = wasm.__wbindgen_export_0(bCh.length, 1);
         new Uint8Array(wasm.memory.buffer, pCh, bCh.length).set(bCh);
 
         // 分配 prefix 字符串内存
         const bPre = Buffer.from(prefix, 'utf8');
-        const pPre = wasm.__wbindgen_export_0(bPre.length, 1);
+        pPre = wasm.__wbindgen_export_0(bPre.length, 1);
         new Uint8Array(wasm.memory.buffer, pPre, bPre.length).set(bPre);
 
         // 调用 wasm_solve(retptr, pCh, lCh, pPre, lPre, difficulty)
-        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
         wasm.wasm_solve(retptr, pCh, bCh.length, pPre, bPre.length, Number(difficulty) || 144000);
 
         const mem32 = new Int32Array(wasm.memory.buffer);
@@ -57,12 +70,20 @@ function solveByWasm(prefix, challengeHex, difficulty) {
         const status = mem32[retptr / 4];
         const answer = memF64[retptr / 8 + 1];
         wasm.__wbindgen_add_to_stack_pointer(16);
+        retptr = 0; // 栈指针已恢复
 
         if (status === 1 && typeof answer === 'number') {
             return Math.round(answer);
         }
     } catch (e) {
         logger.warn('WASM 求解异常，回退纯 JS: ' + e.message);
+    } finally {
+        // 异常路径也必须恢复栈指针，否则后续求解全部错位
+        if (retptr) {
+            try { wasmExports.__wbindgen_add_to_stack_pointer(16); } catch (e) {}
+        }
+        wasmFree(pCh, Buffer.byteLength(challengeHex, 'utf8'));
+        wasmFree(pPre, Buffer.byteLength(prefix, 'utf8'));
     }
     return -1;
 }
@@ -179,8 +200,86 @@ function solveByJs(prefix, challengeHex, difficulty) {
     return -1;
 }
 
-/** 智能统一求解接口（优先 WASM，失败自动回退） */
-function solve(ch) {
+// ---------- JS 兜底求解运行于 worker 线程 ----------
+// BigInt 版 keccak 单次求解可达秒级，同步跑会卡死事件循环、拖停所有并发 SSE 流；
+// 这里把同一套求解函数序列化进常驻 worker，主线程仅做异步等待。
+let jsWorker = null;
+let workerJobs = [];
+let workerSeq = 0;
+
+const JS_WORKER_TIMEOUT_MS = Number(process.env.DS_POW_JS_TIMEOUT_MS || 60000);
+
+const jsWorkerSrc = `
+'use strict';
+const { parentPort } = require('worker_threads');
+// BigInt 字面量序列化：toString() 不带 n 后缀，必须手工补上
+const RC = [${RC.map(x => x.toString() + 'n').join(',')}];
+const M64 = ${M64}n;
+${rotl64.toString()}
+${keccakF24.toString()}
+${readU64LE.toString()}
+${writeU64LE.toString()}
+${deepseekHashV1.toString()}
+${digestMatchPrefix.toString()}
+${solveByJs.toString()}
+parentPort.on('message', (m) => {
+    let answer = -1;
+    try { answer = solveByJs(m.prefix, m.challenge, m.difficulty); } catch (e) { answer = -1; }
+    parentPort.postMessage({ type: 'result', id: m.id, answer });
+});
+`;
+
+function ensureJsWorker() {
+    if (jsWorker) return jsWorker;
+    try {
+        jsWorker = new Worker(jsWorkerSrc, { eval: true });
+        jsWorker.unref();
+        jsWorker.on('message', (m) => {
+            if (!m || m.type !== 'result') return;
+            const idx = workerJobs.findIndex(j => j.id === m.id);
+            if (idx < 0) return; // 已超时移除，结果作废
+            const job = workerJobs.splice(idx, 1)[0];
+            job.resolve(typeof m.answer === 'number' ? m.answer : -1);
+        });
+        const failAll = () => {
+            const jobs = workerJobs.splice(0);
+            jsWorker = null; // 下次任务时重建
+            for (const j of jobs) j.resolve(-1);
+        };
+        jsWorker.on('error', failAll);
+        jsWorker.on('exit', () => { if (workerJobs.length) failAll(); });
+    } catch (e) {
+        jsWorker = null;
+    }
+    return jsWorker;
+}
+
+/** 在 worker 线程里跑纯 JS 求解；worker 不可用/超时返回 -1 */
+function solveInWorker(prefix, challengeHex, difficulty, timeoutMs = JS_WORKER_TIMEOUT_MS) {
+    const w = ensureJsWorker();
+    if (!w) return Promise.resolve(-1);
+    return new Promise((resolve) => {
+        const job = { id: ++workerSeq, resolve: null };
+        const timer = setTimeout(() => {
+            const idx = workerJobs.indexOf(job);
+            if (idx >= 0) workerJobs.splice(idx, 1);
+            resolve(-1);
+        }, timeoutMs);
+        job.resolve = (v) => { clearTimeout(timer); resolve(v); };
+        workerJobs.push(job);
+        try {
+            w.postMessage({ id: job.id, prefix, challenge: challengeHex, difficulty });
+        } catch (e) {
+            const idx = workerJobs.indexOf(job);
+            if (idx >= 0) workerJobs.splice(idx, 1);
+            clearTimeout(timer);
+            resolve(-1);
+        }
+    });
+}
+
+/** 智能统一求解接口（优先 WASM，失败自动回退 worker 线程纯 JS；异步接口） */
+async function solve(ch) {
     const challenge = ch.challenge;
     const salt = ch.salt;
     const expireAt = ch.expire_at;
@@ -196,8 +295,13 @@ function solve(ch) {
     }
 
     if (answer < 0) {
-        mode = 'js-fallback';
-        answer = solveByJs(prefix, challenge, difficulty);
+        mode = 'js-worker';
+        answer = await solveInWorker(prefix, challenge, difficulty);
+        if (answer < 0) {
+            // worker 不可用（构建失败/超时）时的最后容灾：主线程同步兜底
+            mode = 'js-sync-lastresort';
+            answer = solveByJs(prefix, challenge, difficulty);
+        }
     }
 
     const cost = Date.now() - t0;
@@ -289,10 +393,13 @@ const powPool = new PowPool();
 
 module.exports = {
     solve,
-    solvePow: (ch, salt, expireAt, difficulty) => (typeof ch === 'object' ? solve(ch) : solve({ challenge: ch, salt, expire_at: expireAt, difficulty })),
+    solvePow: async (ch, salt, expireAt, difficulty) => (typeof ch === 'object' ? solve(ch) : solve({ challenge: ch, salt, expire_at: expireAt, difficulty })),
     buildHeader,
     buildPowHeader: buildHeader,
     powPool,
     isWasmReady: () => wasmAvailable,
+    solveInWorker,
     POW_POOL_MAX,
+    // 诊断/自测用内部函数，业务代码勿依赖
+    _internals: { deepseekHashV1, digestMatchPrefix, solveByJs },
 };

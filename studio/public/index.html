@@ -104,15 +104,15 @@
     <div class="cfg" style="display:grid;grid-template-columns:2fr 1fr 1fr auto;gap:10px;align-items:end">
       <div>
         <label>Remote Base</label>
-        <input id="cfgBase" placeholder="http://127.0.0.1:19728">
+        <input id="cfgBase" placeholder="http://127.0.0.1:19728" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-bwignore="true">
       </div>
       <div>
         <label>用户</label>
-        <input id="cfgUser" autocomplete="off">
+        <input id="cfgUser" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-form-fill-ignore>
       </div>
       <div>
         <label>密码</label>
-        <input id="cfgPass" type="password" autocomplete="new-password" placeholder="不改请留空 ****">
+        <input id="cfgPass" type="password" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-form-fill-ignore placeholder="不改请留空 ****">
       </div>
       <div class="row">
         <button id="btnSaveCfg">保存</button>
@@ -189,28 +189,28 @@
       <h3 id="modalTitle">编辑账号</h3>
       <div class="field">
         <label>账号名称 (不可修改)</label>
-        <input id="editName" readonly style="opacity:0.8;background:var(--bg)">
+        <input id="editName" readonly style="opacity:0.8;background:var(--bg)" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-bwignore="true">
       </div>
       <div class="field">
         <label>邮箱 (自动登录用，可空)</label>
-        <input id="editEmail" placeholder="user@outlook.com">
+        <input id="editEmail" placeholder="user@outlook.com" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-form-fill-ignore>
       </div>
       <div class="field">
         <label>手机号 (自动登录用，可空)</label>
-        <input id="editMobile" placeholder="13800000000">
+        <input id="editMobile" placeholder="13800000000" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-form-fill-ignore>
       </div>
       <div class="field">
         <label>登录密码 (自动登录/换 Token 用，留空不改)</label>
-        <input id="editPassword" type="password" placeholder="留空不修改">
+        <input id="editPassword" type="password" placeholder="留空不修改" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-form-fill-ignore>
       </div>
       <div class="field">
-        <label><b style="color:var(--accent,#3b82f6)">独立代理 (Proxy)</b> — 支持 HTTP / HTTPS / SOCKS5</label>
-        <input id="editProxy" placeholder="http://127.0.0.1:7890 或 socks5://user:pass@127.0.0.1:10808">
-        <div class="muted" style="font-size:11px;margin-top:3px">填入独立代理后，该账号所有对话请求、PoW 求解与换 Token 将独占该出口 IP 喵</div>
+        <label><b style="color:var(--accent,#3b82f6)">独立代理 (Proxy)</b> — 支持 HTTP / HTTPS / SOCKS5（仅用于 API 对话请求，登录不走代理）</label>
+        <input id="editProxy" placeholder="http://127.0.0.1:7890 或 socks5://user:pass@127.0.0.1:10808" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-bwignore="true">
+        <div class="muted" style="font-size:11px;margin-top:3px">填入独立代理后，该账号对话请求与 PoW 求解独占该出口 IP；登录换 Token 始终直连不走代理喵</div>
       </div>
       <div class="field">
         <label>userToken (可直接粘贴 Token，留空不改)</label>
-        <textarea id="editToken" style="min-height:50px" placeholder="留空不修改"></textarea>
+        <textarea id="editToken" style="min-height:50px" placeholder="留空不修改" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-bwignore="true"></textarea>
       </div>
       <div class="row" style="justify-content:flex-end;margin-top:14px">
         <button id="btnCancelEdit">取消</button>
@@ -228,6 +228,48 @@ let evt = null;
 
 function badge(text, cls) {
   return '<span class="badge ' + (cls||'') + '">' + escapeHtml(text) + '</span>';
+}
+
+// ---------- Toast 与自定义确认框（替代系统 alert/confirm 弹窗） ----------
+function toast(msg, type) {
+  type = type || 'info';
+  let wrap = document.getElementById('toastWrap');
+  if (!wrap) {
+    wrap = document.createElement('div');
+    wrap.id = 'toastWrap';
+    wrap.style.cssText = 'position:fixed;right:18px;bottom:18px;z-index:9999;display:flex;flex-direction:column;gap:8px;max-width:420px';
+    document.body.appendChild(wrap);
+  }
+  const el = document.createElement('div');
+  const colors = { info: '#1d4ed8', ok: '#065f46', err: '#991b1b', warn: '#92400e' };
+  el.style.cssText = 'background:' + (colors[type] || colors.info) + ';color:#fff;padding:10px 14px;border-radius:8px;font-size:13px;box-shadow:0 8px 24px rgba(0,0,0,.45);opacity:0;transform:translateY(8px);transition:all .25s;word-break:break-all';
+  el.textContent = msg;
+  wrap.appendChild(el);
+  requestAnimationFrame(() => { el.style.opacity = '1'; el.style.transform = 'none'; });
+  setTimeout(() => {
+    el.style.opacity = '0'; el.style.transform = 'translateY(8px)';
+    setTimeout(() => el.remove(), 300);
+  }, type === 'err' ? 6000 : 3200);
+}
+
+function confirmBox(msg) {
+  return new Promise(resolve => {
+    const el = document.createElement('div');
+    el.className = 'modal-mask';
+    el.style.zIndex = '10000';
+    el.innerHTML = `
+      <div class="modal">
+        <h3>确认操作</h3>
+        <div style="margin-bottom:14px;font-size:13px">${escapeHtml(msg)}</div>
+        <div class="row" style="justify-content:flex-end">
+          <button class="cancel">取消</button>
+          <button class="primary ok">确认</button>
+        </div>
+      </div>`;
+    document.body.appendChild(el);
+    el.querySelector('.cancel').onclick = () => { el.remove(); resolve(false); };
+    el.querySelector('.ok').onclick = () => { el.remove(); resolve(true); };
+  });
 }
 function escapeHtml(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
@@ -381,7 +423,7 @@ $('#btnSaveCfg').onclick = async () => {
     await api('/api/config', { method: 'POST', body: JSON.stringify(body) });
     $('#cfgPass').value = '';
     logLine('配置已保存');
-  } catch (e) { alert(e.message); }
+  } catch (e) { toast(e.message, 'err'); }
 };
 
 $('#btnTestConn').onclick = async () => {
@@ -395,7 +437,7 @@ $('#btnTestConn').onclick = async () => {
   } catch (e) {
     $('#conn').textContent = '服务端失败';
     $('#conn').className = 'badge err';
-    alert(e.message);
+    toast(e.message, 'err');
   }
 };
 
@@ -407,7 +449,7 @@ $('#btnImport').onclick = async () => {
     });
     logLine('导入 ' + r.added + ' 个' + (r.errors.length ? ' 失败 ' + r.errors.join(',') : ''));
     await loadRows();
-  } catch (e) { alert(e.message); }
+  } catch (e) { toast(e.message, 'err'); }
 };
 
 async function startToken(names) {
@@ -420,13 +462,13 @@ async function startToken(names) {
     const j = await api('/api/job/token', { method: 'POST', body: JSON.stringify(body) });
     setJobBadge(j);
     if (!jobTimer) jobTimer = setInterval(pollJob, 1200);
-  } catch (e) { alert(e.message); }
+  } catch (e) { toast(e.message, 'err'); }
 }
 
 $('#btnToken').onclick = () => startToken(null);
 $('#btnTokenSel').onclick = () => {
   const names = [...document.querySelectorAll('.chk:checked')].map(c => c.dataset.name);
-  if (!names.length) return alert('先勾选账号');
+  if (!names.length) return toast('先勾选账号', 'warn');
   startToken(names);
 };
 $('#btnClearSel').onclick = () => {
@@ -443,7 +485,7 @@ $('#btnPush').onclick = async () => {
     setJobBadge(j);
     (j.log || []).forEach(logLine);
     await loadRows();
-  } catch (e) { alert(e.message); }
+  } catch (e) { toast(e.message, 'err'); }
 };
 
 $('#btnPull').onclick = async () => {
@@ -451,13 +493,13 @@ $('#btnPull').onclick = async () => {
     const r = await api('/api/job/pull', { method: 'POST', body: '{}' });
     logLine('拉取状态 ' + r.count + ' 条');
     await loadRows();
-  } catch (e) { alert(e.message); }
+  } catch (e) { toast(e.message, 'err'); }
 };
 
 // 代理批量分配
 $('#btnAssignAllProxies').onclick = async () => {
   const proxies = $('#proxyPoolText').value.trim();
-  if (!proxies) return alert('请先在上方输入代理列表（每行一个，如 http://127.0.0.1:7890）');
+  if (!proxies) return toast('请先在上方输入代理列表（每行一个，如 http://127.0.0.1:7890）', 'warn');
   try {
     const res = await api('/api/accounts/assign-proxies', {
       method: 'POST',
@@ -466,14 +508,14 @@ $('#btnAssignAllProxies').onclick = async () => {
     logLine('⚡ 均分代理成功: 已更新 ' + res.updated + ' / ' + res.total + ' 个账号');
     await loadRows();
     if ($('#optPushAfter').checked) $('#btnPush').click();
-  } catch (e) { alert(e.message); }
+  } catch (e) { toast(e.message, 'err'); }
 };
 
 $('#btnAssignSelProxies').onclick = async () => {
   const proxies = $('#proxyPoolText').value.trim();
-  if (!proxies) return alert('请先输入代理列表');
+  if (!proxies) return toast('请先输入代理列表', 'warn');
   const names = [...document.querySelectorAll('.chk:checked')].map(c => c.dataset.name);
-  if (!names.length) return alert('请先勾选需要分配代理的账号');
+  if (!names.length) return toast('请先勾选需要分配代理的账号', 'warn');
   try {
     const res = await api('/api/accounts/assign-proxies', {
       method: 'POST',
@@ -482,13 +524,13 @@ $('#btnAssignSelProxies').onclick = async () => {
     logLine('⚡ 勾选账号绑定代理成功: 已更新 ' + res.updated + ' 个账号');
     await loadRows();
     if ($('#optPushAfter').checked) $('#btnPush').click();
-  } catch (e) { alert(e.message); }
+  } catch (e) { toast(e.message, 'err'); }
 };
 
 $('#btnClearProxies').onclick = async () => {
   const names = [...document.querySelectorAll('.chk:checked')].map(c => c.dataset.name);
   const targetDesc = names.length ? ('勾选的 ' + names.length + ' 个账号') : '所有账号';
-  if (!confirm('确定清空 ' + targetDesc + ' 的代理设置？')) return;
+  if (!(await confirmBox('确定清空 ' + targetDesc + ' 的代理设置？'))) return;
   try {
     const res = await api('/api/accounts/assign-proxies', {
       method: 'POST',
@@ -497,7 +539,7 @@ $('#btnClearProxies').onclick = async () => {
     logLine('已清空 ' + res.updated + ' 个账号的代理');
     await loadRows();
     if ($('#optPushAfter').checked) $('#btnPush').click();
-  } catch (e) { alert(e.message); }
+  } catch (e) { toast(e.message, 'err'); }
 };
 
 // 账号单项编辑弹窗
@@ -522,7 +564,7 @@ $('#btnSaveEdit').onclick = async () => {
     logLine('已保存账号 ' + name + (patch.proxy ? (' · 独立代理: ' + patch.proxy) : ' · 代理已清空'));
     await loadRows();
     if ($('#optPushAfter').checked) $('#btnPush').click();
-  } catch (e) { alert('保存失败: ' + e.message); }
+  } catch (e) { toast('保存失败: ' + e.message, 'err'); }
 };
 
 $('#tbody').addEventListener('click', async (e) => {
@@ -541,7 +583,7 @@ $('#tbody').addEventListener('click', async (e) => {
       $('#editToken').value = '';
       $('#editModal').style.display = 'flex';
     } else if (btn.dataset.act === 'del') {
-      if (!confirm('删除本地账号 ' + name + ' ?')) return;
+      if (!(await confirmBox('删除本地账号 ' + name + ' ?'))) return;
       await api('/api/accounts/' + encodeURIComponent(name), { method: 'DELETE' });
       await loadRows();
     } else if (btn.dataset.act === 'dis') {
@@ -553,7 +595,7 @@ $('#tbody').addEventListener('click', async (e) => {
       logLine((disabled ? '禁用 ' : '启用 ') + name + '（服务端权威）');
       await loadRows();
     }
-  } catch (e) { alert(e.message); }
+  } catch (e) { toast(e.message, 'err'); }
 });
 
 (async function init() {

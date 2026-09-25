@@ -134,7 +134,8 @@ const server = app.listen(config.PORT, config.HOST, () => {
 
         async function prewarmAccount(acc) {
             const fills = Array.from({ length: powEngine.POW_POOL_MAX },
-                () => ds.prewarmPoW(acc.token).catch(() => {}));
+                // 必须带上账号独立代理：PoW 池按 token+proxy 作为缓存键，缺了 proxy 会导致预热永远无法命中
+                () => ds.prewarmPoW(acc.token, undefined, acc.proxy || '').catch(() => {}));
             await Promise.all(fills);
         }
 

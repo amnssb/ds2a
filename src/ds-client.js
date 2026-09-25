@@ -308,7 +308,7 @@ async function getPowHeader(token, targetPath, proxy = '') {
     }
 
     const t0 = Date.now();
-    const answer = powEngine.solve(ch);
+    const answer = await powEngine.solve(ch);
     if (answer < 0) {
         throw new DeepSeekApiError('PoW 计算无解', 500, null, targetPath);
     }
@@ -337,7 +337,7 @@ async function prewarmPoW(token, targetPath = TARGET_COMPLETION, proxy = '') {
         const outer = await requestJson(token, 'POST', config.DEEPSEEK.POW_CHALLENGE, { target_path: targetPath }, 30000, proxy);
         const ch = (outer && outer.challenge) ? outer.challenge : outer;
         if (!ch || !ch.challenge) return;
-        const answer = powEngine.solve(ch);
+        const answer = await powEngine.solve(ch);
         if (answer >= 0) {
             const header = powEngine.buildHeader(ch, answer, targetPath);
             const expireAt = ch.expire_at ? Number(ch.expire_at) * 1000 : (Date.now() + 300000);
@@ -509,8 +509,22 @@ async function completion(opts) {
             const t = await r.text().catch(() => '');
             let j = null;
             try { j = JSON.parse(t); } catch (e) {}
-            const bizCode = j && j.code;
+            const bizCode = j && (j.data && j.data.biz_code != null ? j.data.biz_code : j.code);
             throw new DeepSeekApiError(`对话 HTTP ${r.status}: ${t.slice(0, 200)}`, r.status, bizCode, TARGET_COMPLETION);
+        }
+
+        // 检查 Content-Type：若上游返回 application/json，说明发生业务拦截（如 user is muted，biz_code=5）
+        const contentType = String(r.headers.get('content-type') || '').toLowerCase();
+        if (contentType.includes('application/json')) {
+            const t = await r.text().catch(() => '');
+            let j = null;
+            try { j = JSON.parse(t); } catch (e) {}
+            if (j) {
+                const bizCode = (j.data && j.data.biz_code != null) ? j.data.biz_code : j.code;
+                const bizMsg = (j.data && j.data.biz_msg) || j.msg || JSON.stringify(j);
+                throw new DeepSeekApiError(`DeepSeek 业务拦截 [bizCode=${bizCode}]: ${bizMsg}`, 403, bizCode, TARGET_COMPLETION);
+            }
+            throw new DeepSeekApiError(`对话非流式响应: ${t.slice(0, 200)}`, 502, null, TARGET_COMPLETION);
         }
 
         const reader = r.body.getReader();
@@ -535,22 +549,8 @@ async function completion(opts) {
             if (d && onEvent) onEvent(type, d);
         };
 
-        const handleLine = (line) => {
-            if (!line.startsWith('data:')) return;
-            const raw = line.slice(5).trim();
-            if (!raw || raw === '[DONE]') return;
-
-            let j;
-            try {
-                j = JSON.parse(raw);
-            } catch (e) {
-                return;
-            }
-
-            sawAnyEvent = true;
-            if (DS_DEBUG) {
-                logger.info('[SSE] ' + JSON.stringify(j).slice(0, 500));
-            }
+        const handleParsed = (j) => {
+            if (!j || typeof j !== 'object') return;
 
             if (j.response_message_id) messageId = j.response_message_id;
             if (j.v && typeof j.v === 'object' && j.v.response && j.v.response.message_id) {
@@ -560,16 +560,27 @@ async function completion(opts) {
             if (j.code === 'content_filter') throw new DeepSeekApiError('内容被过滤', 400);
 
             const p = typeof j.p === 'string' ? j.p : '';
-            if (p === 'response/accumulated_token_usage') {
+
+            // 0. BATCH 批处理解包：递归处理批处理命令集（如 status, tokens 等）
+            if (j.o === 'BATCH' && Array.isArray(j.v)) {
+                for (const item of j.v) {
+                    if (!item || typeof item !== 'object') continue;
+                    const subP = item.p ? (p ? `${p}/${item.p}` : item.p) : p;
+                    handleParsed({ ...item, p: subP });
+                }
+                return;
+            }
+
+            if (p === 'response/accumulated_token_usage' || p === 'accumulated_token_usage') {
                 tokens = Number(j.v) || tokens;
                 return;
             }
             if (/^response\/fragments\/-?\d+\/status$/.test(p)) return;
-            if (p === 'response/search_status') {
+            if (p === 'response/search_status' || p === 'search_status') {
                 emit('search_status', j.v);
                 return;
             }
-            if (p === 'response/status' || p === 'status') {
+            if (p === 'response/status' || p === 'status' || p === 'quasi_status' || p === 'response/quasi_status') {
                 if (typeof j.v === 'string' && j.v.toUpperCase() === 'FINISHED') {
                     finished = true;
                 }
@@ -578,6 +589,15 @@ async function completion(opts) {
 
             // 1. 处理数组形态的 fragments: [{ id, type, content }, ...] (如 response/fragments APPEND)
             if (Array.isArray(j.v)) {
+                // 若数组项是 BATCH 风格的 { p, v }，转入逐项处理
+                if (j.v.length > 0 && j.v[0] && typeof j.v[0].p === 'string') {
+                    for (const item of j.v) {
+                        if (!item || typeof item !== 'object') continue;
+                        const subP = item.p ? (p ? `${p}/${item.p}` : item.p) : p;
+                        handleParsed({ ...item, p: subP });
+                    }
+                    return;
+                }
                 for (const frag of j.v) {
                     if (!frag || typeof frag !== 'object') continue;
                     const ty = String(frag.type || '').toUpperCase();
@@ -586,7 +606,11 @@ async function completion(opts) {
                         fragmentTypes.set(frag.id, isThink ? 'thinking' : 'text');
                         currentFragmentId = frag.id;
                     }
-                    currentType = isThink ? 'thinking' : 'text';
+                    if (ty === 'RESPONSE' || ty === 'TEXT') {
+                        currentType = 'text';
+                    } else if (isThink) {
+                        currentType = 'thinking';
+                    }
                     const c = typeof frag.content === 'string' ? frag.content : '';
                     if (!c) continue;
                     if (isThink) {
@@ -636,9 +660,15 @@ async function completion(opts) {
                         if (isThink) { thinking += fc; emit('thinking', fc); }
                         else { content += fc; emit('content', fc); }
                     }
-                } else if (typeof rr.content === 'string' && rr.content) {
-                    content += rr.content;
-                    emit('content', rr.content);
+                } else {
+                    if (typeof rr.content === 'string' && rr.content) {
+                        content += rr.content;
+                        emit('content', rr.content);
+                    }
+                    if (typeof rr.text === 'string' && rr.text) {
+                        content += rr.text;
+                        emit('content', rr.text);
+                    }
                 }
                 if (!gotThinkFromFragments && typeof rr.thinking_content === 'string' && rr.thinking_content) {
                     thinking += rr.thinking_content;
@@ -663,20 +693,21 @@ async function completion(opts) {
             }
 
             // 4. 路径 → 类型映射判断
-            if (p === 'response/content') {
+            if (p === 'response/content' || p === 'content') {
                 currentType = 'text';
-            } else if (p === 'response/thinking_content') {
+            } else if (p === 'response/thinking_content' || p === 'thinking_content') {
                 currentType = 'thinking';
             } else {
                 const fm = p.match(/^response\/fragments\/(-?\d+)\/(thinking_content|content)$/);
                 if (fm) {
                     const rawId = Number(fm[1]);
                     const fid = rawId < 0 ? currentFragmentId : rawId;
-                    if (/\/thinking_content$/.test(p)) {
+                    if (fm[2] === 'thinking_content') {
                         currentType = 'thinking';
-                    } else {
+                    } else if (fm[2] === 'content') {
                         const known = fragmentTypes.get(fid);
-                        currentType = known ? known : (thinkingEnabled && fid <= 2 ? 'thinking' : 'text');
+                        // 正文字段 content 默认即为 text，仅在已确认为 thinking 时分类为 thinking
+                        currentType = known ? known : 'text';
                     }
                 } else if (p) {
                     // 未知或特定路径
@@ -693,7 +724,7 @@ async function completion(opts) {
             let text = null;
             if (typeof j.v === 'string') text = j.v;
             if (text == null || text === '') return;
-            if (text === 'FINISHED' && (!p || p === 'status')) {
+            if (text === 'FINISHED' && (!p || p === 'status' || p === 'response/status')) {
                 finished = true;
                 return;
             }
@@ -710,17 +741,36 @@ async function completion(opts) {
             }
         };
 
-        const drainBuf = () => {
-            let idx;
-            while ((idx = buf.indexOf('\n')) >= 0) {
-                const line = buf.slice(0, idx).trim();
-                buf = buf.slice(idx + 1);
-                handleLine(line);
-                if (finished) {
-                    // FINISHED 后继续冲刷同缓冲区内可能残留的正文帧
-                    continue;
-                }
+        const handleLine = (line) => {
+            if (!line.startsWith('data:')) return;
+            const raw = line.slice(5).trim();
+            if (!raw || raw === '[DONE]') return;
+
+            let j;
+            try {
+                j = JSON.parse(raw);
+            } catch (e) {
+                return;
             }
+
+            sawAnyEvent = true;
+            if (DS_DEBUG) {
+                logger.info('[SSE] ' + JSON.stringify(j).slice(0, 500));
+            }
+
+            handleParsed(j);
+        };
+
+        // 偏移扫描：每个 chunk 只做一次字符串压缩，消除逐行 slice 的 O(n²) 开销
+        const drainBuf = () => {
+            let start = 0;
+            let idx;
+            while ((idx = buf.indexOf('\n', start)) >= 0) {
+                const line = buf.slice(start, idx).trim();
+                start = idx + 1;
+                if (line) handleLine(line);
+            }
+            if (start > 0) buf = start >= buf.length ? '' : buf.slice(start);
         };
 
         try {
@@ -759,21 +809,17 @@ async function completion(opts) {
         if (stalled && !content && !thinking) {
             throw new DeepSeekApiError(`上游流式响应停滞超时 (${Math.round(stallBudget / 1000)}s)`, 504, null, TARGET_COMPLETION);
         }
-        if (userAborted) {
+        if (userAborted && !content && !thinking) {
             throw new DeepSeekApiError('客户端已中断请求', 499, null, TARGET_COMPLETION);
         }
         if (abortedMidStream && !content && !thinking) {
             throw new DeepSeekApiError('上游流式连接中断且无内容', 502, null, TARGET_COMPLETION);
         }
-        // 空回复：仅在完全未收到任何 SSE 事件时才触发 failover；
-        // 若已收到事件但解析到空内容，视为上游有效空响应，不触发重试
-        if (!content && !thinking) {
-            if (!sawAnyEvent) {
-                const hint = '未收到任何 SSE 事件';
-                if (DS_DEBUG) logger.warn(`[SSE Empty] ${hint} finished=${finished} tokens=${tokens}`);
-                throw new DeepSeekApiError(`上游返回空响应 (${hint})`, 502, null, TARGET_COMPLETION);
-            }
-            if (DS_DEBUG) logger.warn(`[SSE] 收到事件但无正文/思考内容，视为有效空响应 finished=${finished} tokens=${tokens}`);
+        // 空回复拦截：若最终既无正文又无思考内容，无论是否收到过元数据事件，均视为空响应异常，触发 Failover 重试
+        if (!content && !thinking && !userAborted) {
+            const hint = sawAnyEvent ? '收到事件但未解析到正文或思考内容' : '未收到任何 SSE 事件';
+            logger.warn(`[SSE Empty] ${hint} finished=${finished} tokens=${tokens}`);
+            throw new DeepSeekApiError(`上游返回空响应 (${hint})`, 502, null, TARGET_COMPLETION);
         }
 
         // 思考链与正文兜底分离：若思考字段为空且正文中包含 <think> 标签，自动剥离归位

@@ -1,6 +1,9 @@
 'use strict';
 /**
- * src/ds-login.js — 「账号 + 密码」无头浏览器自动登录 chat.deepseek.com，换回 userToken
+ * src/ds-login.js — 「账号 + 密码」浏览器自动登录 chat.deepseek.com，换回 userToken
+ * - 登录全程直连，不走任何代理（账号代理仅用于服务端 API 对话/PoW）
+ * - 默认无头；DS_LOGIN_HEADFUL=1 走有头窗口（不静默回退无头）
+ * - 有头模式下出现验证码/挑战会持续等待人工处理（默认最长 30 分钟，DS_LOGIN_HEADFUL_WAIT_S 可调），绝不自动关闭窗口
  */
 const fs = require('fs');
 const path = require('path');
@@ -158,11 +161,11 @@ function interpret(status, ctype, text, did) {
     return { ok: false, needCode, deviceId: did, error: friendly(bizCode, msg), raw: JSON.stringify(j).slice(0, 400) };
 }
 
-async function fetchPowHeaderHttp(targetPath, timeoutMs, proxy) {
+async function fetchPowHeaderHttp(targetPath, timeoutMs) {
     try {
         const ac = new AbortController();
         const t = setTimeout(() => ac.abort(), timeoutMs || 20000);
-        const r = await fetch(BASE + POW_PATH, loginFetchOpts(proxy, {
+        const r = await fetch(BASE + POW_PATH, loginFetchOpts('', {
             method: 'POST',
             headers: Object.assign({}, CLIENT_HEADERS, { 'user-agent': UA }),
             body: JSON.stringify({ target_path: targetPath }),
@@ -173,7 +176,7 @@ async function fetchPowHeaderHttp(targetPath, timeoutMs, proxy) {
         const bd = (j && j.data && j.data.biz_data) || {};
         const ch = bd.challenge || bd;
         if (!ch || !ch.challenge) return null;
-        const answer = dspow.solve(ch);
+        const answer = await dspow.solve(ch);
         if (answer < 0) return null;
         return dspow.buildHeader(ch, answer, targetPath);
     } catch (e) {
@@ -194,13 +197,13 @@ async function httpLogin(o) {
         'sec-fetch-dest': 'empty',
         'accept-language': 'en-US,en;q=0.9,zh-CN;q=0.8',
     });
-    const pow = await fetchPowHeaderHttp(LOGIN_PATH, 20000, o.proxy);
+    const pow = await fetchPowHeaderHttp(LOGIN_PATH, 20000);
     if (pow) headers['x-ds-pow-response'] = pow;
 
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), Number(o.timeoutMs || 25000));
     try {
-        const r = await fetch(BASE + LOGIN_PATH, loginFetchOpts(o.proxy, {
+        const r = await fetch(BASE + LOGIN_PATH, loginFetchOpts('', {
             method: 'POST', headers, body: JSON.stringify(body), signal: ac.signal,
         }));
         const text = await r.text();
@@ -214,6 +217,11 @@ class BrowserSession {
     constructor(opts) {
         const o = opts || {};
         this.headless = o.headless !== false;
+        // 登录流程全程直连，不走任何代理（账号代理仅用于 API 对话/PoW 请求）
+        this.proxy = '';
+        this.proxyArg = null;
+        this.proxyUser = '';
+        this.proxyPass = '';
         // 每个 profile 用独立调试端口，避免多账号互踢
         let port = Number(o.port || process.env.DS_LOGIN_PORT || 9701);
         if (!o.port && !process.env.DS_LOGIN_PORT && o.tag) {
@@ -223,23 +231,6 @@ class BrowserSession {
             port = 9701 + (h % 200);
         }
         this.port = port;
-        let rawProxy = String(o.proxy || config.DEFAULT_PROXY || '').trim();
-        this.proxy = rawProxy;
-        this.proxyArg = null;
-        this.proxyUser = '';
-        this.proxyPass = '';
-        if (rawProxy) {
-            let p = rawProxy;
-            if (!/^[a-zA-Z0-9]+:\/\//.test(p)) p = 'http://' + p;
-            try {
-                const u = new URL(p);
-                if (u.username) this.proxyUser = decodeURIComponent(u.username);
-                if (u.password) this.proxyPass = decodeURIComponent(u.password);
-                this.proxyArg = `${u.protocol}//${u.host}`;
-            } catch (e) {
-                this.proxyArg = p;
-            }
-        }
         // 有头专用 profile：避免多账号串会话拿到上一个 userToken
         this.tag = String(o.tag || (this.headless
             ? 'login'
@@ -267,25 +258,33 @@ class BrowserSession {
             '--crash-dumps-dir=' + path.join(profileDir, 'crash'),
             '--remote-allow-origins=*',
             '--no-first-run', '--no-default-browser-check', '--no-sandbox',
-            '--disable-gpu', '--disable-dev-shm-usage',
+            this.headless ? '--disable-gpu' : null,
+            '--disable-dev-shm-usage',
             '--disable-blink-features=AutomationControlled',
+            !this.headless ? '--window-size=1280,900' : null,
+            !this.headless ? '--start-maximized' : null,
             '--user-agent=' + UA,
             'about:blank',
         ].filter(Boolean);
-        this.child = spawn(exe, args, { stdio: 'ignore', windowsHide: true });
+        this.child = spawn(exe, args, {
+            stdio: 'ignore',
+            windowsHide: !!this.headless,
+            detached: !this.headless,
+        });
         this.child.on('error', () => {});
 
         const ver = await this.waitDevtools();
         await this.connect(ver.webSocketDebuggerUrl);
 
         const ct = await this.send('Target.createTarget', { url: 'about:blank' });
-        const att = await this.send('Target.attachToTarget', { targetId: ct.result.targetId, flatten: true });
+        const targetId = ct.result.targetId;
+        const att = await this.send('Target.attachToTarget', { targetId, flatten: true });
         this.sid = att.result.sessionId;
+        if (!this.headless) {
+            await this.send('Target.activateTarget', { targetId }).catch(() => {});
+        }
         await this.send('Page.enable', {}, this.sid);
         await this.send('Runtime.enable', {}, this.sid);
-        if (this.proxyUser && this.proxyPass) {
-            await this.send('Fetch.enable', { handleAuthRequests: true }, this.sid);
-        }
         this.alive = true;
         return this;
     }
@@ -307,17 +306,6 @@ class BrowserSession {
             this.ws.on('message', raw => {
                 let m;
                 try { m = JSON.parse(raw.toString()); } catch (e) { return; }
-                if (m.method === 'Fetch.authRequired') {
-                    this.send('Fetch.continueWithAuth', {
-                        requestId: m.params.requestId,
-                        authChallengeResponse: {
-                            response: 'ProvideCredentials',
-                            username: this.proxyUser,
-                            password: this.proxyPass,
-                        }
-                    }, this.sid).catch(() => {});
-                    return;
-                }
                 if (m.id && this.waiters.has(m.id)) { this.waiters.get(m.id)(m); this.waiters.delete(m.id); }
             });
             this.ws.once('open', res);
@@ -403,10 +391,19 @@ class BrowserSession {
         const limit = timeoutMs || 60000;
         const expr = `(function(){
           try {
-            const pwd = document.querySelector('input[type="password"]');
+            let pwd = document.querySelector('input[type="password"]');
+            if (!pwd) {
+              const spans = [...document.querySelectorAll('.ds-button__content, span, div, a, button')];
+              const pwdBtn = spans.find(s => (s.textContent || '').trim() === '密码登录');
+              if (pwdBtn) {
+                const clickTarget = pwdBtn.closest('div[role="button"], button') || pwdBtn;
+                clickTarget.click();
+              }
+              pwd = document.querySelector('input[type="password"]');
+            }
             if (!pwd) return 'none';
             const form = pwd.form || pwd.closest('form');
-            let email = document.querySelector('input[type="email"],input[name="email"],input[placeholder*="mail" i],input[autocomplete="username"]');
+            let email = document.querySelector('input[type="email"],input[name="email"],input[placeholder*="mail" i],input[placeholder*="邮箱" i],input[placeholder*="手机" i],input[autocomplete="username"]');
             if (!email && form) email = form.querySelector('input:not([type="password"])');
             return 'ok|' + (email ? '1' : '0');
           } catch(e) { return 'err|' + e.message; }
@@ -421,6 +418,42 @@ class BrowserSession {
         return false;
     }
 
+    /** 单次检查登录表单是否可见（不等待） */
+    async signInFormVisible() {
+        try {
+            const s = await this.ev(`(function(){
+              try {
+                let pwd = document.querySelector('input[type="password"]');
+                if (!pwd) {
+                  const spans = [...document.querySelectorAll('.ds-button__content, span, div, a, button')];
+                  const pwdBtn = spans.find(s => (s.textContent || '').trim() === '密码登录');
+                  if (pwdBtn) {
+                    (pwdBtn.closest('div[role="button"], button') || pwdBtn).click();
+                  }
+                  pwd = document.querySelector('input[type="password"]');
+                }
+                return pwd ? '1' : '';
+              } catch(e) { return ''; }
+            })()`);
+            return s === '1';
+        } catch (e) { return false; }
+    }
+
+    /** 检测验证码 / WAF 挑战元素（有头模式下据此提示人工处理并暂停自动提交） */
+    async detectVerification() {
+        try {
+            const s = await this.ev(`(function(){
+              try {
+                if (document.querySelector('iframe[src*="captcha"],iframe[src*="challenge"],iframe[title*="captcha" i],.cf-turnstile,.g-recaptcha,#challenge-stage,#challenge-form,[class*="captcha" i]')) return '1';
+                const t = String(document.title || '');
+                if (/attention required|just a moment|verify|challenge/i.test(t)) return '1';
+                return '';
+              } catch(e) { return ''; }
+            })()`);
+            return s === '1';
+        } catch (e) { return false; }
+    }
+
     async fillAndSubmitLogin(o) {
         const email = String(o.email || '').trim();
         const mobile = String(o.mobile || '').trim();
@@ -430,15 +463,23 @@ class BrowserSession {
 
         const expr = `(function(){
           try {
-            const pwd = document.querySelector('input[type="password"]');
+            let pwd = document.querySelector('input[type="password"]');
+            if (!pwd) {
+              const spans = [...document.querySelectorAll('.ds-button__content, span, div, a, button')];
+              const pwdBtn = spans.find(s => (s.textContent || '').trim() === '密码登录');
+              if (pwdBtn) {
+                (pwdBtn.closest('div[role="button"], button') || pwdBtn).click();
+              }
+              pwd = document.querySelector('input[type="password"]');
+            }
             if (!pwd) return 'no-pwd';
             const form = pwd.form || pwd.closest('form');
-            let emailEl = document.querySelector('input[type="email"],input[name="email"],input[placeholder*="mail" i],input[autocomplete="username"]');
+            let emailEl = document.querySelector('input[type="email"],input[name="email"],input[placeholder*="mail" i],input[placeholder*="邮箱" i],input[placeholder*="手机" i],input[autocomplete="username"]');
             if (!emailEl && form) {
               const inputs = [...(form.querySelectorAll('input')||[])].filter(i => i !== pwd && i.type !== 'hidden' && i.type !== 'submit');
               emailEl = inputs[0] || null;
             }
-            if (!emailEl && ' + JSON.stringify(!!mobile) + ') {
+            if (!emailEl && ` + JSON.stringify(!!mobile) + `) {
               emailEl = document.querySelector('input[name="mobile"],input[type="tel"],input[placeholder*="手机" i]');
             }
             const acc = ${JSON.stringify(account)};
@@ -482,18 +523,30 @@ class BrowserSession {
 
         await this.openSignIn();
         const headful = this.headless === false;
-        const wafTimeout = o.wafTimeoutMs || Number(process.env.DS_WAF_TIMEOUT_S || (headful ? 180 : 45)) * 1000;
+        // 有头模式：默认等待 DS_LOGIN_HEADFUL_WAIT_S（30 分钟）供人工处理验证码；
+        // 上层未显式传 wafTimeoutMs 时不会用短超时把浏览器提前关掉
+        const wafTimeout = o.wafTimeoutMs || Number(process.env.DS_WAF_TIMEOUT_S || (headful ? HEADFUL_WAIT_S : 45)) * 1000;
 
         if (headful) {
             const t0 = Date.now();
             let lastLog = 0;
             let submitted = false;
             let submitAt = 0;
-            console.log('[ds-login] 有头：等待登录页/人工登录，超时 ' + Math.round(wafTimeout / 1000) + 's');
+            let verifyHinted = false;
+            console.log('[ds-login] 有头：窗口已打开，等待登录/人工操作，最长 ' + Math.round(wafTimeout / 60000) + ' 分钟（如出现验证码请在窗口手动完成，脚本不会自动关闭窗口）');
             while (Date.now() - t0 < wafTimeout) {
                 const tok = await this.readUserToken();
                 if (tok && tok.length > 20) {
                     return { ok: true, token: tok, deviceId: did, from: 'manual-headful' };
+                }
+
+                // 验证元素检测：提示人工处理，绝不自动退出、绝不打断
+                const verify = await this.detectVerification();
+                if (verify && !verifyHinted) {
+                    verifyHinted = true;
+                    console.log('[ds-login] 检测到验证/挑战元素，请在浏览器窗口手动完成，脚本持续等待 token…');
+                } else if (!verify) {
+                    verifyHinted = false;
                 }
 
                 if (!submitted) {
@@ -507,19 +560,22 @@ class BrowserSession {
                         }
                     }
                 } else if (Date.now() - submitAt > 8000) {
-                    // 提交后 8s 仍无 token：可能要点验证码，再补一次提交
+                    // 提交后 8s 仍无 token：仅当登录表单重新可见（说明提交被退回）才补交，
+                    // 验证期间绝不重复提交打扰人工操作
                     const tok2 = await this.readUserToken();
                     if (tok2 && tok2.length > 20) {
                         return { ok: true, token: tok2, deviceId: did, from: 'form-headful' };
                     }
-                    await this.fillAndSubmitLogin(o);
-                    submitAt = Date.now();
+                    if (!verify && await this.signInFormVisible()) {
+                        await this.fillAndSubmitLogin(o);
+                        submitAt = Date.now();
+                    }
                 }
 
                 const elapsed = Date.now() - t0;
-                if (elapsed - lastLog >= 5000) {
+                if (elapsed - lastLog >= 30000) {
                     lastLog = elapsed;
-                    console.log('[ds-login] 有头登录中… ' + Math.round(elapsed / 1000) + 's / ' + Math.round(wafTimeout / 1000) + 's' + (submitted ? ' (已提交表单)' : ' (等表单)'));
+                    console.log('[ds-login] 有头登录中… ' + Math.round(elapsed / 1000) + 's / ' + Math.round(wafTimeout / 1000) + 's' + (submitted ? ' (已提交表单)' : ' (等表单)') + (verify ? ' (等待人工验证)' : ''));
                 }
                 await sleep(1000);
             }
@@ -528,7 +584,7 @@ class BrowserSession {
                 return { ok: true, token: tokEnd, deviceId: did, from: 'manual-headful' };
             }
             // 有头超时：仍带上下文返回，便于上层提示人工登录
-            return { ok: false, waf: true, deviceId: did, error: '有头登录超时：未拿到 userToken（请在窗口完成验证码/手动登录后重试）' };
+            return { ok: false, waf: true, deviceId: did, error: '有头登录等待超时：未拿到 userToken（可在窗口完成验证码/手动登录后重试）' };
         }
 
         const wafOk = await this.waitWaf(wafTimeout);
@@ -562,7 +618,7 @@ class BrowserSession {
                 const bd = (j && j.data && j.data.biz_data) || {};
                 const c = bd.challenge || bd;
                 if (c && c.challenge) {
-                    const answer = dspow.solve(c);
+                    const answer = await dspow.solve(c);
                     if (answer >= 0) pow = dspow.buildHeader(c, answer, LOGIN_PATH);
                 }
             }
@@ -629,13 +685,16 @@ const STARTING = new Map();
 let IDLE_TIMER = null;
 const IDLE_MS = Number(process.env.DS_LOGIN_IDLE_S || 120) * 1000;
 
-async function sharedSession(headless, profileTag, proxy) {
-    const key = (headless ? 'h' : 'f') + ':' + (profileTag || 'default') + ':' + (proxy || '');
+// 有头模式等待人工处理验证码/手动登录的最长时间（默认 30 分钟，可配）
+const HEADFUL_WAIT_S = Number(process.env.DS_LOGIN_HEADFUL_WAIT_S || 1800);
+
+async function sharedSession(headless, profileTag) {
+    const key = (headless ? 'h' : 'f') + ':' + (profileTag || 'default');
     const cur = SESSIONS.get(key);
     if (cur && cur.alive) return cur;
     if (STARTING.has(key)) return STARTING.get(key);
     const p = (async () => {
-        const s = new BrowserSession({ headless, tag: headless ? 'login' : ('login-headful-' + (profileTag || 'default')), proxy });
+        const s = new BrowserSession({ headless, tag: headless ? 'login' : ('login-headful-' + (profileTag || 'default')) });
         await s.start();
         SESSIONS.set(key, s);
         return s;
@@ -650,8 +709,8 @@ function touchShared() {
     if (IDLE_TIMER.unref) IDLE_TIMER.unref();
 }
 
-async function dropShared(headless, profileTag, proxy) {
-    const key = (headless ? 'h' : 'f') + ':' + (profileTag || 'default') + ':' + (proxy || '');
+async function dropShared(headless, profileTag) {
+    const key = (headless ? 'h' : 'f') + ':' + (profileTag || 'default');
     const s = SESSIONS.get(key);
     SESSIONS.delete(key);
     if (s) await s.close().catch(() => {});
@@ -672,19 +731,20 @@ function httpAllowed() {
 
 async function loginViaBrowsers(o) {
     if (!WS) {
-        return { ok: false, error: '无头登录失败：缺少 ws 依赖（npm i ws），且未找到可用浏览器' };
+        return { ok: false, error: '浏览器登录失败：缺少 ws 依赖（npm i ws），且未找到可用浏览器' };
     }
 
-    // 默认纯无头；DS_LOGIN_HEADFUL=1 时优先有头（便于人工看/点）
+    // 默认纯无头；DS_LOGIN_HEADFUL=1 时走有头（窗口可见，便于人工处理验证），
+    // 有头模式绝不静默回退无头，否则窗口一闪而过等于没有有头
     const headful = process.env.DS_LOGIN_HEADFUL === '1' || process.env.DS_LOGIN_HEADFUL === 'true';
-    const order = headful ? [false, true] : [true];
+    const order = headful ? [false] : [true];
     const profileTag = o.profileTag || o.name || seedOf(o) || 'default';
     let last = null;
 
     for (const hl of order) {
         let sess;
         try {
-            sess = await sharedSession(hl, profileTag, o.proxy);
+            sess = await sharedSession(hl, profileTag);
         } catch (e) {
             last = { ok: false, error: (hl ? '无头' : '有头') + '浏览器启动失败: ' + e.message };
             continue;
@@ -695,13 +755,15 @@ async function loginViaBrowsers(o) {
             touchShared();
             if (r.ok) return r;
             last = r;
-            if (r.waf || isRiskish(r)) await dropShared(hl, profileTag, o.proxy);
+            // 有头模式失败（等待人工处理超时等）保留浏览器窗口，由上层决定何时关闭；
+            // 仅无头失败路径立即回收浏览器
+            if (hl && (r.waf || isRiskish(r))) await dropShared(hl, profileTag);
         } catch (e) {
             last = { ok: false, error: '浏览器登录异常: ' + e.message };
-            await dropShared(hl, profileTag, o.proxy).catch(() => {});
+            await dropShared(hl, profileTag).catch(() => {});
         }
     }
-    return last || { ok: false, error: '无头登录未产生结果' };
+    return last || { ok: false, error: '浏览器登录未产生结果' };
 }
 
 async function login(opts) {

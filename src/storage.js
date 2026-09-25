@@ -6,6 +6,41 @@
 const fs = require('fs');
 const path = require('path');
 const config = require('./config');
+const logger = require('./logger');
+
+// requests.jsonl 轮转配置：超过阈值滚动为 .1/.2/.3，最旧的直接删除
+const REQUESTS_ROTATE_BYTES = Math.max(1, Number(process.env.DS_REQUESTS_ROTATE_MB || 20)) * 1024 * 1024;
+const REQUESTS_KEEP_ROTATIONS = Math.max(1, Number(process.env.DS_REQUESTS_KEEP || 3));
+// 启动时只读文件末尾，避免大文件全量同步读取阻塞启动
+const BOOT_TAIL_BYTES = 2 * 1024 * 1024;
+// 按日统计保留天数
+const DAY_STATS_KEEP_DAYS = Math.max(1, Number(process.env.DS_STATS_KEEP_DAYS || 30));
+
+// 只读取流水日志末尾若干字节；文件超限时从最后一个完整行开始，避免解析半行残片
+function readRequestsTail(file) {
+    const st = fs.statSync(file);
+    if (st.size <= BOOT_TAIL_BYTES) {
+        return fs.readFileSync(file, 'utf8');
+    }
+    const start = st.size - BOOT_TAIL_BYTES;
+    const len = st.size - start;
+    const buf = Buffer.alloc(len);
+    const fd = fs.openSync(file, 'r');
+    try {
+        let read = 0;
+        while (read < len) {
+            const n = fs.readSync(fd, buf, read, len - read, start + read);
+            if (n <= 0) break;
+            read += n;
+        }
+        let content = buf.toString('utf8');
+        const nl = content.indexOf('\n');
+        content = nl >= 0 ? content.slice(nl + 1) : '';
+        return content;
+    } finally {
+        fs.closeSync(fd);
+    }
+}
 
 class PersistentStorage {
     constructor() {
@@ -39,6 +74,7 @@ class PersistentStorage {
         this.errors = []; // 最近 100 条错误
         this._writeBuffer = [];
         this._saveTimer = null;
+        this._needsStatsFlush = false;
 
         this.init();
     }
@@ -60,10 +96,10 @@ class PersistentStorage {
             }
         }
 
-        // 2. 加载最近历史请求
+        // 2. 加载最近历史请求（大文件只读尾部，避免启动阻塞）
         if (fs.existsSync(this.requestsFile)) {
             try {
-                const content = fs.readFileSync(this.requestsFile, 'utf8');
+                const content = readRequestsTail(this.requestsFile);
                 const lines = content.trim().split('\n').filter(Boolean);
                 // 取最后 500 条，按时间降序（最新在前）
                 const slice = lines.slice(-500);
@@ -192,26 +228,65 @@ class PersistentStorage {
         this._writeBuffer.push(JSON.stringify(item));
     }
 
-    /** 异步落盘 */
+    /** 异步落盘（含流水日志轮转与过期统计清理） */
     flush() {
-        if (!this._writeBuffer.length) return;
-        const chunk = this._writeBuffer.join('\n') + '\n';
+        if (!this._writeBuffer.length && !this._needsStatsFlush) {
+            // 无新数据也周期性触发轮转检查，保证无人写入时大文件同样会被滚动
+            this._rotateRequestsIfNeeded();
+            return;
+        }
+        const chunk = this._writeBuffer.length ? (this._writeBuffer.join('\n') + '\n') : '';
         this._writeBuffer = [];
 
         try {
+            this._rotateRequestsIfNeeded();
             config.assertNotCDrive(this.requestsFile);
-            fs.appendFileSync(this.requestsFile, chunk, 'utf8');
+            if (chunk) fs.appendFileSync(this.requestsFile, chunk, 'utf8');
+            // 追加后复查一次：本次写入刚好越过阈值时立刻轮转，不必等下一个周期
+            this._rotateRequestsIfNeeded();
         } catch (e) {
             console.error('[storage] 追加日志失败:', e.message);
         }
 
         try {
+            this._pruneOldDayStats();
             config.assertNotCDrive(this.statsFile);
             const tmp = this.statsFile + '.tmp';
             fs.writeFileSync(tmp, JSON.stringify(this.lifetime, null, 2), 'utf8');
             fs.renameSync(tmp, this.statsFile);
+            this._needsStatsFlush = false;
         } catch (e) {
             console.error('[storage] 保存聚合统计失败:', e.message);
+        }
+    }
+
+    /** requests.jsonl 超过阈值时滚动为 .1/.2/.3，最旧的删除 */
+    _rotateRequestsIfNeeded() {
+        let size = 0;
+        try { size = fs.statSync(this.requestsFile).size; } catch (e) { return; }
+        if (size < REQUESTS_ROTATE_BYTES) return;
+        try {
+            const oldest = this.requestsFile + '.' + REQUESTS_KEEP_ROTATIONS;
+            if (fs.existsSync(oldest)) fs.rmSync(oldest, { force: true });
+            for (let i = REQUESTS_KEEP_ROTATIONS - 1; i >= 1; i--) {
+                const from = this.requestsFile + '.' + i;
+                if (fs.existsSync(from)) fs.renameSync(from, this.requestsFile + '.' + (i + 1));
+            }
+            fs.renameSync(this.requestsFile, this.requestsFile + '.1');
+            logger.warn(`requests.jsonl 已超过 ${Math.round(REQUESTS_ROTATE_BYTES / 1048576)}MB，完成一次日志轮转喵`);
+        } catch (e) {
+            console.error('[storage] 流水日志轮转失败:', e.message);
+        }
+    }
+
+    /** 清理超过保留期的按日统计，防止 stats.json 无限膨胀 */
+    _pruneOldDayStats() {
+        const byDay = this.lifetime.byDay;
+        const keys = Object.keys(byDay);
+        if (keys.length <= DAY_STATS_KEEP_DAYS) return;
+        const cutoff = this.dayKey(Date.now() - DAY_STATS_KEEP_DAYS * 24 * 3600 * 1000);
+        for (const k of keys) {
+            if (k < cutoff) delete byDay[k];
         }
     }
 

@@ -27,11 +27,22 @@ class AccountPool {
         this.rootFile = path.join(config.ROOT_DIR, 'accounts.json');
         this.accounts = [];
         this.cursor = 0;
+        this._rawCache = null;
         this.reload();
     }
 
-    /** 读取原始账号数据，支持双向比对合并 */
+    /** 读取原始账号数据，支持双向比对合并（带 mtime 缓存，避免热路径反复读盘） */
     readRaw() {
+        // mtime 未变化时直接复用上次合并结果：文件级 stat 开销远小于每次全量读盘+JSON.parse
+        let mRoot = -1;
+        let mData = -1;
+        try { mRoot = fs.existsSync(this.rootFile) ? fs.statSync(this.rootFile).mtimeMs : -1; } catch (e) {}
+        try { mData = fs.existsSync(this.dataFile) ? fs.statSync(this.dataFile).mtimeMs : -1; } catch (e) {}
+        if (this._rawCache && this._rawCache.mRoot === mRoot && this._rawCache.mData === mData) {
+            // 返回浅拷贝，保持"每次读取得到独立副本"的旧语义，调用方可安全原地修改后再写回
+            return this._rawCache.merged.map(x => ({ ...x }));
+        }
+
         let rootList = [];
         let dataList = [];
 
@@ -87,6 +98,7 @@ class AccountPool {
         }
 
         const merged = [...mergedMap.values()];
+        this._rawCache = { mRoot, mData, merged };
         if (merged.length === 0 && rootList.length === 0 && dataList.length === 0) {
             this.writeRaw([]);
             return [];
@@ -95,7 +107,7 @@ class AccountPool {
         if (rootHasNew) {
             this.writeRaw(merged);
         }
-        return merged;
+        return merged.map(x => ({ ...x }));
     }
 
     /** 写入磁盘（双向保证 data/accounts.json 和根目录 accounts.json 完全同步） */
@@ -132,6 +144,12 @@ class AccountPool {
             logger.err('accounts.json 双路写入均失败，内存态可能在重启后丢失');
             return false;
         }
+        // 写入成功后用新 mtime 回填缓存，紧随其后的 statusSnapshot/readRaw 不再重复读盘
+        let mRoot = -1;
+        let mData = -1;
+        try { mRoot = fs.existsSync(this.rootFile) ? fs.statSync(this.rootFile).mtimeMs : -1; } catch (e) {}
+        try { mData = fs.existsSync(this.dataFile) ? fs.statSync(this.dataFile).mtimeMs : -1; } catch (e) {}
+        this._rawCache = { mRoot, mData, merged: JSON.parse(str) };
         return true;
     }
 
@@ -172,7 +190,7 @@ class AccountPool {
                 failures: (prev && !tokenChanged) ? prev.failures : 0,
                 okCount: prev ? prev.okCount : 0,
                 errCount: prev ? prev.errCount : 0,
-                inflight: 0,
+                inflight: prev ? (prev.inflight || 0) : 0,
                 lastError: tokenChanged ? '' : (prev ? prev.lastError : (item.lastLoginError || '')),
                 lastUsedAt: prev ? prev.lastUsedAt : 0,
             };
@@ -200,10 +218,22 @@ class AccountPool {
      * @param {Array<string>} excludeNames - 本次请求中已尝试失败的账号名列表
      * @param {string|null} preferName - 优先粘滞的会话原账号（仍健康时复用，避免 sid/token 错配）
      */
+    /**
+     * 构造"无账号可用"错误：携带 503 状态码，
+     * 让网关快速失败并在监控中与普通 500 区分（客户端可据此退避重试）
+     */
+    _noAccountError(msg, accountName = null) {
+        const e = new Error(msg);
+        e.statusCode = 503;
+        e.noAccount = true;
+        if (accountName) e.accountName = accountName;
+        return e;
+    }
+
     acquire(excludeNames = [], preferName = null) {
         const n = this.accounts.length;
         if (!n) {
-            throw new Error('账号池为空，请在管理控制台「账号管理」中添加 DeepSeek 账号喵');
+            throw this._noAccountError('账号池为空，请在管理控制台「账号管理」中添加 DeepSeek 账号喵');
         }
 
         const now = Date.now();
@@ -213,10 +243,11 @@ class AccountPool {
         const activeAccounts = this.accounts.filter(a => !a.disabled && a.token);
         if (activeAccounts.length === 0) {
             const hasDisabled = this.accounts.some(a => a.disabled);
-            if (hasDisabled) {
-                throw new Error('所有配置的账号均已被手动停用，请在控制台启用账号调度喵');
-            }
-            throw new Error('账号池内暂无配置有效 Token 的账号，请在控制台填入 userToken 喵');
+            const msg = hasDisabled
+                ? '所有配置的账号均已被手动停用，请在控制台启用账号调度喵'
+                : '账号池内暂无配置有效 Token 的账号，请在控制台填入 userToken 喵';
+            const accName = this.accounts.length > 0 ? this.accounts.map(a => a.name).join(',') : null;
+            throw this._noAccountError(msg, accName);
         }
 
         // 2. 检查未被本次 Failover 排除的账号集合
@@ -224,10 +255,11 @@ class AccountPool {
         if (nonExcluded.length === 0) {
             // 本次请求已经将所有账号轮询尝试过一遍
             const pausedFirst = activeAccounts.find(a => a.paused || a.state === STATUS.AUTH_FAILED);
-            if (pausedFirst && pausedFirst.lastError) {
-                throw new Error(`所有可用账号均尝试失败（原因: ${pausedFirst.lastError}），请在控制台检查并更新 Token 喵`);
-            }
-            throw new Error(`池中全部 ${activeAccounts.length} 个账号均已在本次请求中尝试过，暂无更多可用账号喵`);
+            const msg = (pausedFirst && pausedFirst.lastError)
+                ? `所有可用账号均尝试失败（原因: ${pausedFirst.lastError}），请在控制台检查并更新 Token 喵`
+                : `池中全部 ${activeAccounts.length} 个账号均已在本次请求中尝试过，暂无更多可用账号喵`;
+            const accName = excludeNames.length ? excludeNames.join('->') : activeAccounts.map(a => a.name).join(',');
+            throw this._noAccountError(msg, accName);
         }
 
         // 3. 优先从未暂停 (未熔断) 且不在冷却期、且未达单账号并发上限的账号中筛选候选者
@@ -287,7 +319,8 @@ class AccountPool {
         const pausedList = nonExcluded.filter(a => a.paused || a.state === STATUS.AUTH_FAILED);
         if (pausedList.length === nonExcluded.length) {
             const firstErr = pausedList[0].lastError || 'Token 已失效或认证未通过';
-            throw new Error(`可用账号已熔断暂停（原因: ${firstErr}），请在控制台「账号管理」中更新有效 Token 喵`);
+            const accName = pausedList.map(a => a.name).join(',');
+            throw this._noAccountError(`可用账号已熔断暂停（原因: ${firstErr}），请在控制台「账号管理」中更新有效 Token 喵`, accName);
         }
 
         // 5. 若未排除账号都在冷却期中，挑一个冷却时间最快到期的账号进行尝试（借鉴原版容灾自愈设计）
@@ -298,7 +331,7 @@ class AccountPool {
             const waitSec = Math.max(0, Math.round((best.disabledUntil - now) / 1000));
             // 如果冷却期超过 10 秒则提示稍后，如果在 10 秒以内则直接借用它尝试自愈
             if (waitSec > 10) {
-                throw new Error(`账号正在冷却中（最快需等待 ${waitSec} 秒），请稍后重试喵`);
+                throw this._noAccountError(`账号正在冷却中（最快需等待 ${waitSec} 秒），请稍后重试喵`, best.name);
             }
             best.inflight = Math.max(0, (best.inflight || 0) + 1);
             best.lastUsedAt = now;
@@ -350,7 +383,7 @@ class AccountPool {
             acc.state = STATUS.AUTH_FAILED;
             acc.paused = true;
             logger.err(`🚨 账号 ${acc.name} 认证失效 [bizCode=${bizCode}]，已立即熔断并暂停调度！错误: ${errMsg}`);
-            this.persistAccountState(acc.index, { paused: true, lastLoginError: errMsg });
+            this.persistAccountState(acc.name, { paused: true, lastLoginError: errMsg });
 
             // 若配置了账密且开启 autoLogin，尝试自愈重登
             if (acc.autoLogin && acc.password && (acc.email || acc.mobile)) {
@@ -359,10 +392,21 @@ class AccountPool {
             return;
         }
 
-        // 网络抖动 / 空响应 / 停滞：短暂轻冷却，不计入熔断计数，避免单账号误暂停
+        const isMutedOrBanned = bizCode === 5 ||
+            /user is muted|account banned|forbidden|被禁言/i.test(errMsg);
+
+        if (isMutedOrBanned) {
+            acc.state = STATUS.PAUSED;
+            acc.paused = true;
+            logger.err(`🚨 账号 ${acc.name} 被官方风控禁言/封禁 [bizCode=${bizCode}]，已立即熔断并暂停调度！错误: ${errMsg}`);
+            this.persistAccountState(acc.name, { paused: true, lastLoginError: errMsg });
+            return;
+        }
+
+        // 网络抖动 / 空响应 / 停滞：短暂轻冷却，超过 3 次则按普通故障累计熔断，避免死循环空回
         const isTransient = /上游网络异常|空响应|连接中断|停滞超时|fetch failed|AbortError|UND_ERR|ECONNRESET|ETIMEDOUT/i.test(errMsg)
             || statusCode === 502 || statusCode === 504;
-        if (isTransient) {
+        if (isTransient && acc.failures < 3) {
             const lightMs = 3000;
             acc.disabledUntil = Math.max(acc.disabledUntil, Date.now() + lightMs);
             if (acc.state !== STATUS.PAUSED && acc.state !== STATUS.AUTH_FAILED) {
@@ -384,7 +428,7 @@ class AccountPool {
             acc.state = STATUS.PAUSED;
             acc.paused = true;
             logger.err(`账号 ${acc.name} 连续失败 ${failLimit} 次，已自动暂停调度！`);
-            this.persistAccountState(acc.index, { paused: true, lastLoginError: '连续多次失败，已自动暂停' });
+            this.persistAccountState(acc.name, { paused: true, lastLoginError: '连续多次失败，已自动暂停' });
         }
     }
 
@@ -417,10 +461,17 @@ class AccountPool {
         }
     }
 
-    persistAccountState(index, patch) {
+    /**
+     * 持久化单个账号的运行时状态。
+     * 按 name 定位（而非 index）：readRaw 每次合并双文件后顺序可能变化，按 index 会打错账号。
+     */
+    persistAccountState(name, patch) {
         const raw = this.readRaw();
-        if (index >= 0 && index < raw.length) {
-            Object.assign(raw[index], patch);
+        const idx = typeof name === 'string'
+            ? raw.findIndex(a => (a.name || '') === name)
+            : name;
+        if (idx >= 0 && idx < raw.length) {
+            Object.assign(raw[idx], patch);
             this.writeRaw(raw);
         }
     }

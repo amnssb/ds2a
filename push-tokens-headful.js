@@ -116,7 +116,6 @@ async function headfulLogin(acc) {
         name: acc.name,
         profileTag: acc.name,
         timeoutMs: 45000,
-        wafTimeoutMs: Number(process.env.DS_WAF_TIMEOUT_MS || 90000),
         loginRetries: 8,
     };
     const t0 = Date.now();

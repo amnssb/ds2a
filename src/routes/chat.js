@@ -20,6 +20,26 @@ const router = express.Router();
 
 // ---------- 会话管理（DS parent_message_id 续接） ----------
 const sessions = new Map(); // sessionKey -> { sid, parent, token, accName, lastUsed, ephemeral }
+// 容量上限：客户端若用随机 x-session-id 刷接口，无上限 Map 会持续膨胀撑爆内存
+const SESSIONS_MAX = Math.max(50, Number(process.env.DS_SESSIONS_MAX || 500));
+
+/** 写入会话并按 LRU 淘汰最久未用的条目（Map 迭代序即插入序） */
+function setSession(key, val) {
+    if (sessions.has(key)) sessions.delete(key);
+    sessions.set(key, val);
+    while (sessions.size > SESSIONS_MAX) {
+        const oldestKey = sessions.keys().next().value;
+        const old = sessions.get(oldestKey);
+        sessions.delete(oldestKey);
+        if (old) ds.deleteSession(old.token, old.sid, old.proxy || '').catch(() => {});
+    }
+}
+
+/** 命中即刷新 LRU 顺序 */
+function touchSession(key) {
+    const v = sessions.get(key);
+    if (v) setSession(key, v);
+}
 
         // 定期清理闲置会话
 setInterval(async () => {
@@ -233,6 +253,12 @@ function parseToolCalls(text) {
     return { content: clean, toolCalls: calls };
 }
 
+/** 工具参数宽容解析：模型可能输出非法 JSON，解析失败时保留原始串，避免整个请求 500 */
+function safeParseToolArgs(raw) {
+    const s = raw || '{}';
+    try { return JSON.parse(s); } catch (e) { return { _raw: String(s) }; }
+}
+
 function createToolCallFilter(hasTools, emit) {
     if (!hasTools) return { push: (d) => emit(d), flush: () => {} };
     const START = TC_START, END = TC_END;
@@ -289,9 +315,69 @@ function resolveApiKey(req) {
     return { keyId: null, name: '(匿名)' };
 }
 
+// ---------- 用量入账（OpenAI / Claude 两端点共用） ----------
+function accountingSuccess(r, { endpoint, id, t0, model, stream, keyInfo, sess, usage }) {
+    const { pTokens, cTokens, tTokens } = usage;
+    try {
+        storage.record({
+            id,
+            at: t0,
+            endpoint,
+            model: model || 'deepseek-v4.1-flash',
+            ok: true,
+            status: 200,
+            ms: Date.now() - t0,
+            stream,
+            tools: r.hasTools,
+            thinking: r.thinkingEnabled,
+            search: r.search,
+            account: r.accountName,
+            keyName: keyInfo.name,
+            session: sess.ephemeral ? '(一次性)' : sess.key,
+            ephemeral: sess.ephemeral,
+            promptTokens: pTokens,
+            completionTokens: cTokens,
+            thinkingTokens: tTokens,
+        });
+        auth.recordUsage({
+            keyId: keyInfo.keyId,
+            account: r.accountName,
+            ok: true,
+            promptTokens: pTokens,
+            completionTokens: cTokens,
+            thinkingTokens: tTokens,
+        });
+    } catch (recErr) {
+        logger.err(endpoint + ' 记录用量失败: ' + recErr.message);
+    }
+}
+
+function accountingFailure({ endpoint, id, t0, model, stream, keyInfo, status, error, account }) {
+    try {
+        storage.record({
+            id,
+            at: t0,
+            endpoint,
+            model: model || 'deepseek-v4.1-flash',
+            ok: false,
+            status,
+            ms: Date.now() - t0,
+            stream,
+            error,
+            account: account || 'unknown',
+            keyName: keyInfo.name,
+        });
+        auth.recordUsage({
+            keyId: keyInfo.keyId,
+            account: account || 'failed',
+            ok: false,
+        });
+    } catch (recErr) {}
+}
+
 // ---------- 核心执行逻辑（多账号 Failover 故障转移） ----------
 async function executeWithFailover(opts) {
-    const { body, sessionKey, ephemeral, signal, onThinking, onDelta } = opts;
+    const { body, sessionKey, ephemeral, signal, onThinking, onDelta, stream } = opts;
     const thinking = resolveThinking(body);
     const search = resolveSearch(body);
     const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
@@ -308,7 +394,12 @@ async function executeWithFailover(opts) {
 
     const excludedAccounts = [];
     const transientRetried = new Set();
+    const triedAccounts = [];
+    let lastAccountName = null;
     let lastError = null;
+    // 流式模式下只要已向客户端吐出过任何增量，就绝不能再换账号重试，
+    // 否则第二次完整回复会拼接在第一次的残句之后，造成内容重复错乱
+    let emittedOnce = false;
 
     // 流式累计（execute 内闭包，供空回复校验）
     let _streamContent = '';
@@ -336,13 +427,23 @@ async function executeWithFailover(opts) {
 
         // 会话粘滞账号：已有会话时优先复用原账号（sid/token 必须同账号）
         const prevSess = sessions.get(sessionKey);
+        if (prevSess) touchSession(sessionKey);
         const preferName = prevSess && prevSess.accName ? prevSess.accName : null;
 
         let account = null;
         try {
             account = accountPool.acquire(excludedAccounts, preferName);
+            lastAccountName = account.name;
+            if (!triedAccounts.includes(account.name)) triedAccounts.push(account.name);
         } catch (e) {
-            throw lastError ? lastError : e;
+            const errToThrow = lastError || e;
+            if (!errToThrow.accountName) {
+                errToThrow.accountName = e.accountName || lastAccountName || (triedAccounts.length ? triedAccounts.join('->') : (preferName || 'unknown'));
+            } else if (triedAccounts.length > 1) {
+                errToThrow.accountName = triedAccounts.join('->');
+            }
+            errToThrow.triedAccounts = triedAccounts;
+            throw errToThrow;
         }
 
         try {
@@ -373,7 +474,7 @@ async function executeWithFailover(opts) {
                     lastUsed: Date.now(),
                     ephemeral: !!ephemeral,
                 };
-                sessions.set(sessionKey, sess);
+                setSession(sessionKey, sess);
                 logger.info(`新建会话 ${sessionKey} → 账号: ${account.name} | sid: ${sid.slice(0, 8)}`);
             }
             sess.lastUsed = Date.now();
@@ -403,6 +504,7 @@ async function executeWithFailover(opts) {
                 searchEnabled: search,
                 refFileIds: uploadedFileIds,
                 onEvent: (ty, d) => {
+                    if (stream) emittedOnce = true;
                     if (ty === 'thinking') {
                         _streamThinking += d;
                         onThinking(d);
@@ -415,12 +517,18 @@ async function executeWithFailover(opts) {
                 proxy: accProxy,
             });
 
-// 空回复兜底（上游有时 200 但正文/思考均为空）
-// 与 ds-client.js 保持一致：仅当完全未收到 SSE 事件时才视为空回复
-// 若上游返回了事件但内容为空，视为有效响应（可能是上游临时空内容）
-// ds-client 已在流结束时处理 sawAnyEvent 逻辑，此处不再额外抛异常
-const streamedContent = contentSnapshot();
-const streamedThinking = thinkingSnapshot();
+            // 空回复双重防线：若最终既无正文又无思考内容，视为上游空响应抛错，触发重试/Failover
+            const streamedContent = contentSnapshot();
+            const streamedThinking = thinkingSnapshot();
+            const finalContent = r.content || streamedContent;
+            const finalThinking = r.thinking || streamedThinking;
+
+            if (!finalContent && !finalThinking) {
+                const clientCancel = signal && signal.aborted;
+                if (!clientCancel) {
+                    throw Object.assign(new Error('上游返回空响应 (无正文且无思考内容)'), { statusCode: 502 });
+                }
+            }
 
             if (r.messageId) sess.parent = r.messageId;
             accountPool.markOk(account);
@@ -443,11 +551,24 @@ const streamedThinking = thinkingSnapshot();
             };
         } catch (err) {
             lastError = err;
+            if (account && !lastError.accountName) {
+                lastError.accountName = account.name;
+            }
+            // 发生空响应或断流时，立即清理会话上下文缓存，防止残留的 parent_message_id 导致后续请求持续空回
+            if (/空响应|未收到任何 SSE 事件|连接中断/i.test(err.message || '')) {
+                sessions.delete(sessionKey);
+            }
             const bizCode = err.bizCode || (err.message && err.message.match(/code=(\d+)/) ? Number(err.message.match(/code=(\d+)/)[1]) : null);
             // 客户端主动取消不惩罚账号
             const clientCancel = err && (err.statusCode === 499 || /客户端已中断/i.test(err.message || ''));
             if (!clientCancel) {
                 accountPool.markFail(account, err, err.statusCode || 500, bizCode);
+            }
+            // 流式已出口：重试必然造成重复拼接，直接把错误抛给端点收尾，不再 Failover
+            if (stream && emittedOnce) {
+                if (account && !err.accountName) err.accountName = account.name;
+                err.triedAccounts = triedAccounts;
+                throw err;
             }
             // 瞬时网络/空响应：不立刻排除账号，允许同一请求内快速重试一次
             const transient = !clientCancel && (
@@ -469,7 +590,14 @@ const streamedThinking = thinkingSnapshot();
         }
     }
 
-    throw lastError || new Error('所有可用账号均尝试失败喵');
+    const finalErr = lastError || new Error('所有可用账号均尝试失败喵');
+    if (!finalErr.accountName) {
+        finalErr.accountName = lastAccountName || (triedAccounts.length ? triedAccounts.join('->') : 'unknown');
+    } else if (triedAccounts.length > 1) {
+        finalErr.accountName = triedAccounts.join('->');
+    }
+    finalErr.triedAccounts = triedAccounts;
+    throw finalErr;
 }
 
 // ===== OpenAI 兼容端点 =====
@@ -505,13 +633,15 @@ router.post('/v1/chat/completions', async (req, res) => {
 
     const sess = resolveSessionKey(req, body);
 
-    if (stream) {
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
-        res.setHeader('X-Accel-Buffering', 'no');
-        if (res.flushHeaders) res.flushHeaders();
-    }
+    const ensureStreamHeaders = () => {
+        if (stream && !res.headersSent) {
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Accel-Buffering', 'no');
+            if (res.flushHeaders) res.flushHeaders();
+        }
+    };
 
     let content = '', thinking = '';
     const ac = new AbortController();
@@ -525,6 +655,7 @@ router.post('/v1/chat/completions', async (req, res) => {
     const filter = createToolCallFilter(hasTools, (d) => {
         content += d;
         if (stream) {
+            ensureStreamHeaders();
             if (!oaiRoleSent) {
                 res.write('data: ' + JSON.stringify(oaiChunk(id, { role: 'assistant', content: d }, body.model)) + '\n\n');
                 oaiRoleSent = true;
@@ -543,6 +674,7 @@ router.post('/v1/chat/completions', async (req, res) => {
             onThinking: d => {
                 thinking += d;
                 if (stream) {
+                    ensureStreamHeaders();
                     if (!oaiRoleSent) {
                         res.write('data: ' + JSON.stringify(oaiChunk(id, { role: 'assistant' }, body.model)) + '\n\n');
                         oaiRoleSent = true;
@@ -555,6 +687,7 @@ router.post('/v1/chat/completions', async (req, res) => {
         filter.flush();
 
         if (stream && !oaiRoleSent) {
+            ensureStreamHeaders();
             res.write('data: ' + JSON.stringify(oaiChunk(id, { role: 'assistant' }, body.model)) + '\n\n');
             oaiRoleSent = true;
         }
@@ -566,39 +699,16 @@ router.post('/v1/chat/completions', async (req, res) => {
         const { pTokens, cTokens, tTokens, totalTokens } = computeUsage(r, rawContent, thinking);
 
         // 记录用量与请求日志（失败不影响已开流的收尾帧）
-        try {
-            storage.record({
-                id,
-                at: t0,
-                endpoint: '/v1/chat/completions',
-                model: body.model || 'deepseek-v4.1-flash',
-                ok: true,
-                status: 200,
-                ms: Date.now() - t0,
-                stream,
-                tools: r.hasTools,
-                thinking: r.thinkingEnabled,
-                search: r.search,
-                account: r.accountName,
-                keyName: keyInfo.name,
-                session: sess.ephemeral ? '(一次性)' : sess.key,
-                ephemeral: sess.ephemeral,
-                promptTokens: pTokens,
-                completionTokens: cTokens,
-                thinkingTokens: tTokens,
-            });
-
-            auth.recordUsage({
-                keyId: keyInfo.keyId,
-                account: r.accountName,
-                ok: true,
-                promptTokens: pTokens,
-                completionTokens: cTokens,
-                thinkingTokens: tTokens,
-            });
-        } catch (recErr) {
-            logger.err('chat 记录用量失败: ' + recErr.message);
-        }
+        accountingSuccess(r, {
+            endpoint: '/v1/chat/completions',
+            id,
+            t0,
+            model: body.model,
+            stream,
+            keyInfo,
+            sess,
+            usage: { pTokens, cTokens, tTokens },
+        });
 
         // OpenAI 官方语义：completion 含 reasoning，total = prompt + completion
         const clientUsage = {
@@ -609,6 +719,16 @@ router.post('/v1/chat/completions', async (req, res) => {
         };
 
         if (stream) {
+            // 若流式输出中从未输出过任何正文内容，但存在思考内容，补发思考内容作为 content 帧（防止只认 content 的客户端空显）
+            if (!content && (r.thinking || thinking) && !parsed.toolCalls.length) {
+                const thinkText = r.thinking || thinking;
+                if (!oaiRoleSent) {
+                    res.write('data: ' + JSON.stringify(oaiChunk(id, { role: 'assistant' }, body.model)) + '\n\n');
+                    oaiRoleSent = true;
+                }
+                res.write('data: ' + JSON.stringify(oaiChunk(id, { content: thinkText }, body.model)) + '\n\n');
+            }
+
             for (let i = 0; i < parsed.toolCalls.length; i++) {
                 const tc = parsed.toolCalls[i];
                 res.write('data: ' + JSON.stringify(oaiChunk(id, { tool_calls: [{ index: i, id: tc.id, type: 'function', function: { name: tc.function.name, arguments: tc.function.arguments } }] }, body.model)) + '\n\n');
@@ -630,7 +750,11 @@ router.post('/v1/chat/completions', async (req, res) => {
             res.write('data: [DONE]\n\n');
             res.end();
         } else {
-            const msg = { role: 'assistant', content: parsed.toolCalls.length ? (parsed.content || null) : parsed.content };
+            let finalContent = parsed.toolCalls.length ? (parsed.content || null) : parsed.content;
+            if (!finalContent && (r.thinking || thinking)) {
+                finalContent = r.thinking || thinking;
+            }
+            const msg = { role: 'assistant', content: finalContent };
             if (r.thinking || thinking) msg.reasoning_content = r.thinking || thinking;
             if (parsed.toolCalls.length) msg.tool_calls = parsed.toolCalls;
 
@@ -649,42 +773,33 @@ router.post('/v1/chat/completions', async (req, res) => {
         logger.err('chat/completions 失败: ' + e.message);
 
         const status = (e.statusCode && e.statusCode >= 400 && e.statusCode < 600 && e.statusCode !== 499) ? e.statusCode : 500;
+        const failAcc = e.accountName || (e.triedAccounts && e.triedAccounts.length ? e.triedAccounts.join('->') : 'unknown');
         // 统计入账失败不阻断错误响应
-        try {
-            storage.record({
-                id,
-                at: t0,
-                endpoint: '/v1/chat/completions',
-                model: body.model || 'deepseek-v4.1-flash',
-                ok: false,
-                status,
-                ms: Date.now() - t0,
-                stream,
-                error: e.message,
-                keyName: keyInfo.name,
-            });
-
-            auth.recordUsage({
-                keyId: keyInfo.keyId,
-                account: 'failed',
-                ok: false,
-            });
-        } catch (recErr) {}
+        accountingFailure({
+            endpoint: '/v1/chat/completions',
+            id,
+            t0,
+            model: body.model,
+            stream,
+            keyInfo,
+            status,
+            error: e.message,
+            account: failAcc,
+        });
 
         if (!res.headersSent) {
-            res.status(status).json({ error: { message: e.message, type: 'api_error' } });
+            res.status(status).json({
+                error: {
+                    message: e.message,
+                    type: 'api_error',
+                    code: status,
+                }
+            });
         } else {
-            // 流已开：补发错误信息正文 + 合法 finish_reason('stop') + [DONE]，彻底消除 AI SDK finish reason "other"
+            // 流已开（在吐字中间发生断流）：向客户端发送标准错误数据帧并优雅关闭，绝不将错误伪造成 assistant 正常回复
             try {
                 if (!res.writableEnded) {
-                    const errMsg = `[服务响应异常: ${e.message}]`;
-                    if (!oaiRoleSent) {
-                        res.write('data: ' + JSON.stringify(oaiChunk(id, { role: 'assistant', content: errMsg }, body.model)) + '\n\n');
-                        oaiRoleSent = true;
-                    } else {
-                        res.write('data: ' + JSON.stringify(oaiChunk(id, { content: '\n\n' + errMsg }, body.model)) + '\n\n');
-                    }
-                    res.write('data: ' + JSON.stringify(oaiFinish(id, 'stop', body.model)) + '\n\n');
+                    res.write('data: ' + JSON.stringify({ error: { message: e.message, type: 'stream_error', code: status } }) + '\n\n');
                     res.write('data: [DONE]\n\n');
                     res.end();
                 }
@@ -707,15 +822,18 @@ router.post('/v1/messages', async (req, res) => {
 
     const sess = resolveSessionKey(req, body);
 
-    if (stream) {
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
-        if (res.flushHeaders) res.flushHeaders();
-        // 先按请求内容估算 input_tokens，避免 message_start 恒为 0 导致客户端无法统计入站用量喵
-        const estInput = estimateRequestInputTokens(body);
-        res.write('event: message_start\ndata: ' + JSON.stringify({ type: 'message_start', message: { id, type: 'message', role: 'assistant', model: body.model || 'deepseek-v4.1-flash', content: [], stop_reason: null, usage: { input_tokens: estInput, output_tokens: 0 } } }) + '\n\n');
-    }
+    const ensureStreamStarted = () => {
+        if (stream && !res.headersSent) {
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Accel-Buffering', 'no');
+            if (res.flushHeaders) res.flushHeaders();
+            // 先按请求内容估算 input_tokens，避免 message_start 恒为 0 导致客户端无法统计入站用量喵
+            const estInput = estimateRequestInputTokens(body);
+            res.write('event: message_start\ndata: ' + JSON.stringify({ type: 'message_start', message: { id, type: 'message', role: 'assistant', model: body.model || 'deepseek-v4.1-flash', content: [], stop_reason: null, usage: { input_tokens: estInput, output_tokens: 0 } } }) + '\n\n');
+        }
+    };
 
     let content = '', thinking = '';
     const ac = new AbortController();
@@ -746,6 +864,7 @@ router.post('/v1/messages', async (req, res) => {
 
     const textBlockIndex = () => {
         if (textIdx >= 0) return textIdx;
+        ensureStreamStarted();
         stopThinkBlock();
         textIdx = nextIdx++;
         res.write('event: content_block_start\ndata: ' + JSON.stringify({ type: 'content_block_start', index: textIdx, content_block: { type: 'text', text: '' } }) + '\n\n');
@@ -754,6 +873,7 @@ router.post('/v1/messages', async (req, res) => {
 
     const ensureThinkBlock = () => {
         if (thinkBlockIdx >= 0) return thinkBlockIdx;
+        ensureStreamStarted();
         thinkBlockIdx = nextIdx++;
         res.write('event: content_block_start\ndata: ' + JSON.stringify({ type: 'content_block_start', index: thinkBlockIdx, content_block: { type: 'thinking', thinking: '', signature: '' } }) + '\n\n');
         return thinkBlockIdx;
@@ -775,47 +895,38 @@ router.post('/v1/messages', async (req, res) => {
             onDelta: d => filter.push(d),
         });
         filter.flush();
+        if (stream && !res.headersSent) {
+            ensureStreamStarted();
+        }
 
         const rawContent = r.content || content;
         const parsed = (r.hasTools || hasTools) ? parseToolCalls(rawContent) : { content: rawContent, toolCalls: [] };
         const finish = parsed.toolCalls.length ? 'tool_use' : 'end_turn';
 
-        // 无 text 增量时也保证至少有一个 text 块（客户端期待固定块序）
-        if (stream && textIdx < 0 && !parsed.toolCalls.length) {
+        // 若流式输出中从未输出过任何 text delta，但有 thinking 输出，补发思考内容作为 text block 内容（防止客户端空显）
+        if (stream && !content && (r.thinking || thinking) && !parsed.toolCalls.length) {
+            const idx = textBlockIndex();
+            const thinkText = r.thinking || thinking;
+            res.write('event: content_block_delta\ndata: ' + JSON.stringify({ type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text: thinkText } }) + '\n\n');
+            content = thinkText;
+        } else if (stream && textIdx < 0 && !parsed.toolCalls.length) {
+            // 无 text 增量时也保证至少有一个 text 块（客户端期待固定块序）
             textBlockIndex();
         }
 
         const { pTokens, cTokens, tTokens } = computeUsage(r, rawContent, thinking);
         const outTokens = cTokens + tTokens;
 
-        try {
-            storage.record({
-                id,
-                at: t0,
-                endpoint: '/v1/messages',
-                model: body.model || 'deepseek-v4.1-flash',
-                ok: true,
-                status: 200,
-                ms: Date.now() - t0,
-                stream,
-                account: r.accountName,
-                keyName: keyInfo.name,
-                promptTokens: pTokens,
-                completionTokens: cTokens,
-                thinkingTokens: tTokens,
-            });
-
-            auth.recordUsage({
-                keyId: keyInfo.keyId,
-                account: r.accountName,
-                ok: true,
-                promptTokens: pTokens,
-                completionTokens: cTokens,
-                thinkingTokens: tTokens,
-            });
-        } catch (recErr) {
-            logger.err('messages 记录用量失败: ' + recErr.message);
-        }
+        accountingSuccess(r, {
+            endpoint: '/v1/messages',
+            id,
+            t0,
+            model: body.model,
+            stream,
+            keyInfo,
+            sess,
+            usage: { pTokens, cTokens, tTokens },
+        });
 
         if (stream) {
             // 收尾：先 stop 仍在打开的 text，再 stop 尚未关闭的 thinking
@@ -823,6 +934,29 @@ router.post('/v1/messages', async (req, res) => {
                 res.write('event: content_block_stop\ndata: ' + JSON.stringify({ type: 'content_block_stop', index: textIdx }) + '\n\n');
             }
             stopThinkBlock();
+            for (const tc of parsed.toolCalls) {
+                const bIdx = nextIdx++;
+                res.write('event: content_block_start\ndata: ' + JSON.stringify({
+                    type: 'content_block_start',
+                    index: bIdx,
+                    content_block: {
+                        type: 'tool_use',
+                        id: tc.id,
+                        name: tc.function.name,
+                        input: {}
+                    }
+                }) + '\n\n');
+                const rawArgs = typeof tc.function.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function.arguments || {});
+                res.write('event: content_block_delta\ndata: ' + JSON.stringify({
+                    type: 'content_block_delta',
+                    index: bIdx,
+                    delta: {
+                        type: 'input_json_delta',
+                        partial_json: rawArgs
+                    }
+                }) + '\n\n');
+                res.write('event: content_block_stop\ndata: ' + JSON.stringify({ type: 'content_block_stop', index: bIdx }) + '\n\n');
+            }
             res.write('event: message_delta\ndata: ' + JSON.stringify({ type: 'message_delta', delta: { stop_reason: finish }, usage: { output_tokens: outTokens } }) + '\n\n');
             res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
             res.end();
@@ -832,13 +966,14 @@ router.post('/v1/messages', async (req, res) => {
             if (r.thinking || thinking) {
                 blocks.push({ type: 'thinking', thinking: r.thinking || thinking, signature: 'sig_' + id.slice(-8) });
             }
-            if (rawContent) blocks.push({ type: 'text', text: rawContent });
+            const effectiveText = rawContent || ((r.thinking || thinking) ? (r.thinking || thinking) : '');
+            if (effectiveText) blocks.push({ type: 'text', text: effectiveText });
             for (const tc of parsed.toolCalls) {
                 blocks.push({
                     type: 'tool_use',
                     id: tc.id,
                     name: tc.function.name,
-                    input: JSON.parse(tc.function.arguments || '{}'),
+                    input: safeParseToolArgs(tc.function.arguments),
                 });
             }
 
@@ -855,46 +990,29 @@ router.post('/v1/messages', async (req, res) => {
     } catch (e) {
         logger.err('v1/messages 失败: ' + e.message);
 
+        const status = (e.statusCode && e.statusCode >= 400 && e.statusCode < 600 && e.statusCode !== 499) ? e.statusCode : 500;
+        const failAcc = e.accountName || (e.triedAccounts && e.triedAccounts.length ? e.triedAccounts.join('->') : 'unknown');
         // 与 OpenAI 端点对齐：失败请求同样入账，避免 Claude 失败调用在统计中完全丢失喵
         // 统计入账失败不阻断收尾
-        try {
-            storage.record({
-                id,
-                at: t0,
-                endpoint: '/v1/messages',
-                model: body.model || 'deepseek-v4.1-flash',
-                ok: false,
-                status: (e.statusCode && e.statusCode >= 400 && e.statusCode < 600) ? e.statusCode : 500,
-                ms: Date.now() - t0,
-                stream,
-                error: e.message,
-                keyName: keyInfo.name,
-            });
-
-            auth.recordUsage({
-                keyId: keyInfo.keyId,
-                account: 'failed',
-                ok: false,
-            });
-        } catch (recErr) {}
+        accountingFailure({
+            endpoint: '/v1/messages',
+            id,
+            t0,
+            model: body.model,
+            stream,
+            keyInfo,
+            status,
+            error: e.message,
+            account: failAcc,
+        });
 
         if (!res.headersSent) {
-            res.status(500).json({ type: 'error', error: { type: 'api_error', message: e.message } });
+            res.status(status).json({ type: 'error', error: { type: 'api_error', message: e.message } });
         } else {
-            // 流已开：补发错误信息文本 + 关闭未完结 content block，并补 message_delta(stop_reason) + message_stop
+            // 流已开（在吐字中间发生断流）：向客户端发送标准 Anthropic error event，绝不将错误伪造成 assistant 正常回复
             try {
                 if (!res.writableEnded) {
-                    const errMsg = `[服务响应异常: ${e.message}]`;
-                    if (typeof textIdx === 'undefined' || textIdx < 0) {
-                        if (typeof textBlockIndex === 'function') textBlockIndex();
-                    }
-                    if (typeof textIdx !== 'undefined' && textIdx >= 0) {
-                        res.write('event: content_block_delta\ndata: ' + JSON.stringify({ type: 'content_block_delta', index: textIdx, delta: { type: 'text_delta', text: '\n\n' + errMsg } }) + '\n\n');
-                        res.write('event: content_block_stop\ndata: ' + JSON.stringify({ type: 'content_block_stop', index: textIdx }) + '\n\n');
-                    }
-                    if (typeof stopThinkBlock === 'function') stopThinkBlock();
-                    res.write('event: message_delta\ndata: ' + JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 0 } }) + '\n\n');
-                    res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+                    res.write('event: error\ndata: ' + JSON.stringify({ type: 'error', error: { type: 'api_error', message: e.message } }) + '\n\n');
                     res.end();
                 }
             } catch (e2) {}
