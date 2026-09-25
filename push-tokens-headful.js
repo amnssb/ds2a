@@ -131,6 +131,7 @@ async function headfulLogin(acc) {
         deviceId: acc.deviceId || '',
         name: acc.name,
         profileTag: acc.name,
+        proxy: acc.proxy || '',
         timeoutMs: 45000,
         loginRetries: 8,
     };

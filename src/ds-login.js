@@ -162,11 +162,11 @@ function interpret(status, ctype, text, did) {
     return { ok: false, needCode, deviceId: did, error: friendly(bizCode, msg), raw: JSON.stringify(j).slice(0, 400) };
 }
 
-async function fetchPowHeaderHttp(targetPath, timeoutMs) {
+async function fetchPowHeaderHttp(targetPath, timeoutMs, proxy = '') {
     try {
         const ac = new AbortController();
         const t = setTimeout(() => ac.abort(), timeoutMs || 20000);
-        const r = await fetch(BASE + POW_PATH, loginFetchOpts('', {
+        const r = await fetch(BASE + POW_PATH, loginFetchOpts(proxy, {
             method: 'POST',
             headers: Object.assign({}, CLIENT_HEADERS, { 'user-agent': UA }),
             body: JSON.stringify({ target_path: targetPath }),
@@ -198,13 +198,13 @@ async function httpLogin(o) {
         'sec-fetch-dest': 'empty',
         'accept-language': 'en-US,en;q=0.9,zh-CN;q=0.8',
     });
-    const pow = await fetchPowHeaderHttp(LOGIN_PATH, 20000);
+    const pow = await fetchPowHeaderHttp(LOGIN_PATH, 20000, o.proxy || '');
     if (pow) headers['x-ds-pow-response'] = pow;
 
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), Number(o.timeoutMs || 25000));
     try {
-        const r = await fetch(BASE + LOGIN_PATH, loginFetchOpts('', {
+        const r = await fetch(BASE + LOGIN_PATH, loginFetchOpts(o.proxy || '', {
             method: 'POST', headers, body: JSON.stringify(body), signal: ac.signal,
         }));
         const text = await r.text();
@@ -218,11 +218,24 @@ class BrowserSession {
     constructor(opts) {
         const o = opts || {};
         this.headless = o.headless !== false;
-        // 登录流程全程直连，不走任何代理（账号代理仅用于 API 对话/PoW 请求）
-        this.proxy = '';
+        // 支持账号级独立代理，确保登录、验证码、抓取 Token 与后续调用保持同一个出口 IP
+        const proxy = String(o.proxy || '').trim();
+        this.proxy = proxy;
         this.proxyArg = null;
         this.proxyUser = '';
         this.proxyPass = '';
+        if (proxy) {
+            let p = proxy;
+            if (!/^[a-zA-Z0-9]+:\/\//.test(p)) p = 'http://' + p;
+            try {
+                const u = new URL(p);
+                this.proxyArg = u.protocol + '//' + u.host;
+                this.proxyUser = u.username ? decodeURIComponent(u.username) : '';
+                this.proxyPass = u.password ? decodeURIComponent(u.password) : '';
+            } catch (e) {
+                this.proxyArg = proxy;
+            }
+        }
         // 每个 profile 用独立调试端口，避免多账号互踢
         let port = Number(o.port || process.env.DS_LOGIN_PORT || 9701);
         if (!o.port && !process.env.DS_LOGIN_PORT && o.tag) {
@@ -286,6 +299,9 @@ class BrowserSession {
         }
         await this.send('Page.enable', {}, this.sid);
         await this.send('Runtime.enable', {}, this.sid);
+        if (this.proxyUser || this.proxyPass) {
+            await this.send('Fetch.enable', { handleAuthRequests: true }, this.sid).catch(() => {});
+        }
         this.alive = true;
         return this;
     }
@@ -307,6 +323,17 @@ class BrowserSession {
             this.ws.on('message', raw => {
                 let m;
                 try { m = JSON.parse(raw.toString()); } catch (e) { return; }
+                if (m.method === 'Fetch.authRequired') {
+                    this.send('Fetch.continueWithAuth', {
+                        requestId: m.params.requestId,
+                        authChallengeResponse: {
+                            response: 'ProvideCredentials',
+                            username: this.proxyUser,
+                            password: this.proxyPass,
+                        }
+                    }, this.sid).catch(() => {});
+                    return;
+                }
                 if (m.id && this.waiters.has(m.id)) { this.waiters.get(m.id)(m); this.waiters.delete(m.id); }
             });
             this.ws.once('open', res);
@@ -888,13 +915,17 @@ const IDLE_MS = Number(process.env.DS_LOGIN_IDLE_S || 120) * 1000;
 // 有头模式等待人工处理验证码/手动登录的最长时间（默认 30 分钟，可配）
 const HEADFUL_WAIT_S = Number(process.env.DS_LOGIN_HEADFUL_WAIT_S || 1800);
 
-async function sharedSession(headless, profileTag) {
-    const key = (headless ? 'h' : 'f') + ':' + (profileTag || 'default');
+async function sharedSession(headless, profileTag, proxy) {
+    const key = (headless ? 'h' : 'f') + ':' + (profileTag || 'default') + ':' + (proxy || '');
     const cur = SESSIONS.get(key);
     if (cur && cur.alive) return cur;
     if (STARTING.has(key)) return STARTING.get(key);
     const p = (async () => {
-        const s = new BrowserSession({ headless, tag: headless ? 'login' : ('login-headful-' + (profileTag || 'default')) });
+        const s = new BrowserSession({
+            headless,
+            proxy: proxy || '',
+            tag: headless ? 'login' : ('login-headful-' + (profileTag || 'default'))
+        });
         await s.start();
         SESSIONS.set(key, s);
         return s;
@@ -909,8 +940,8 @@ function touchShared() {
     if (IDLE_TIMER.unref) IDLE_TIMER.unref();
 }
 
-async function dropShared(headless, profileTag) {
-    const key = (headless ? 'h' : 'f') + ':' + (profileTag || 'default');
+async function dropShared(headless, profileTag, proxy) {
+    const key = (headless ? 'h' : 'f') + ':' + (profileTag || 'default') + ':' + (proxy || '');
     const s = SESSIONS.get(key);
     SESSIONS.delete(key);
     if (s) await s.close().catch(() => {});
@@ -939,12 +970,13 @@ async function loginViaBrowsers(o) {
     const headful = process.env.DS_LOGIN_HEADFUL === '1' || process.env.DS_LOGIN_HEADFUL === 'true';
     const order = headful ? [false] : [true];
     const profileTag = o.profileTag || o.name || seedOf(o) || 'default';
+    const proxy = o.proxy || '';
     let last = null;
 
     for (const hl of order) {
         let sess;
         try {
-            sess = await sharedSession(hl, profileTag);
+            sess = await sharedSession(hl, profileTag, proxy);
         } catch (e) {
             last = { ok: false, error: (hl ? '无头' : '有头') + '浏览器启动失败: ' + e.message };
             continue;
@@ -957,10 +989,10 @@ async function loginViaBrowsers(o) {
             last = r;
             // 有头模式失败（等待人工处理超时等）保留浏览器窗口，由上层决定何时关闭；
             // 仅无头失败路径立即回收浏览器
-            if (hl && (r.waf || isRiskish(r))) await dropShared(hl, profileTag);
+            if (hl && (r.waf || isRiskish(r))) await dropShared(hl, profileTag, proxy);
         } catch (e) {
             last = { ok: false, error: '浏览器登录异常: ' + e.message };
-            await dropShared(hl, profileTag).catch(() => {});
+            await dropShared(hl, profileTag, proxy).catch(() => {});
         }
     }
     return last || { ok: false, error: '浏览器登录未产生结果' };
