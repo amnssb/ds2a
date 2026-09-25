@@ -829,8 +829,10 @@ async function completion(opts) {
             for (;;) {
                 drainBuf();
                 if (finished) {
-                    // 状态已结束但可能还有残留内容帧在网络中，继续读取冲刷
-                    if (finishedDraining) break;
+                    // 状态已结束但可能还有残留内容帧在网络中，继续读取冲刷直至 buffer 彻底排空
+                    if (finishedDraining) {
+                        if (!buf) break;
+                    }
                     finishedDraining = true;
                 }
 
@@ -857,20 +859,31 @@ async function completion(opts) {
 
         try { reader.cancel(); } catch (e) {}
 
-        if (stalled && !content && !thinking) {
-            throw new DeepSeekApiError(`上游流式响应停滞超时 (${Math.round(stallBudget / 1000)}s)`, 504, null, TARGET_COMPLETION);
-        }
-        if (userAborted && !content && !thinking) {
+        // 客户端主动取消
+        if (userAborted) {
             throw new DeepSeekApiError('客户端已中断请求', 499, null, TARGET_COMPLETION);
         }
-        if (abortedMidStream && !content && !thinking) {
-            throw new DeepSeekApiError('上游流式连接中断且无内容', 502, null, TARGET_COMPLETION);
+
+        // 停滞超时且未收到完整结束
+        if (stalled && !finished) {
+            throw new DeepSeekApiError(`上游流式响应停滞超时 (${Math.round(stallBudget / 1000)}s)，思考:${thinking.length}字，正文:${content.length}字`, 504, null, TARGET_COMPLETION);
         }
+
+        // 中途连接中断且未收到完整结束标志
+        if (abortedMidStream && !finished) {
+            throw new DeepSeekApiError(`上游流式连接中途断开异常，思考:${thinking.length}字，正文:${content.length}字`, 502, null, TARGET_COMPLETION);
+        }
+
         // 空回复拦截：若最终既无正文又无思考内容，无论是否收到过元数据事件，均视为空响应异常，触发 Failover 重试
-        if (!content && !thinking && !userAborted) {
+        if (!content && !thinking) {
             const hint = sawAnyEvent ? '收到事件但未解析到正文或思考内容' : '未收到任何 SSE 事件';
             logger.warn(`[SSE Empty] ${hint} finished=${finished} tokens=${tokens}`);
             throw new DeepSeekApiError(`上游返回空响应 (${hint})`, 502, null, TARGET_COMPLETION);
+        }
+
+        // 预警：若思考内容存在但正文为空（通常为长任务导致思考阶段耗尽单次回复 Token 上限截断）
+        if (!content && thinking) {
+            logger.warn(`⚠️ [SSE Incomplete] 上游模型仅输出了思考链 (${thinking.length} 字)，正文为空（可能因任务复杂度极高导致官方单次 Token 上限截断）`);
         }
 
         // 思考链与正文兜底分离：若思考字段为空且正文中包含 <think> 标签，自动剥离归位

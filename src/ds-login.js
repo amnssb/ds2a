@@ -386,29 +386,107 @@ class BrowserSession {
         catch (e) { return { status: 0, error: '页面返回无法解析: ' + String(raw).slice(0, 120) }; }
     }
 
-    async waitSignInForm(timeoutMs) {
-        const t0 = Date.now();
-        const limit = timeoutMs || 60000;
+    /** 页面级统一自适应切换表单模式（CN 验证码登录 -> 密码登录 -> 邮箱/手机登录） */
+    async switchFormMode(isEmail) {
         const expr = `(function(){
           try {
+            function isVisible(el) {
+              if (!el) return false;
+              return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+            }
+
+            let switchedPwd = false;
+            let switchedEmail = false;
+
+            // 1. 若当前页面无密码输入框，说明是国内默认的「验证码登录」模式，自动寻找并点击「密码登录」
             let pwd = document.querySelector('input[type="password"]');
             if (!pwd) {
-              const spans = [...document.querySelectorAll('.ds-button__content, span, div, a, button')];
-              const pwdBtn = spans.find(s => (s.textContent || '').trim() === '密码登录');
+              const elements = [...document.querySelectorAll('button, a, div[role="button"], span, div, li, [role="tab"], .ds-button__content')];
+              const pwdBtn = elements.find(el => {
+                const t = (el.textContent || '').replace(/\\s+/g, '');
+                return (t.includes('密码登录') || t.includes('账号密码登录') || t.includes('使用密码登录') || t === '密码') && isVisible(el);
+              });
               if (pwdBtn) {
-                const clickTarget = pwdBtn.closest('div[role="button"], button') || pwdBtn;
-                clickTarget.click();
+                const target = pwdBtn.closest('button, div[role="button"], a') || pwdBtn;
+                target.click();
+                switchedPwd = true;
               }
               pwd = document.querySelector('input[type="password"]');
             }
-            if (!pwd) return 'none';
-            const form = pwd.form || pwd.closest('form');
-            let email = document.querySelector('input[type="email"],input[name="email"],input[placeholder*="mail" i],input[placeholder*="邮箱" i],input[placeholder*="手机" i],input[autocomplete="username"]');
-            if (!email && form) email = form.querySelector('input:not([type="password"])');
-            return 'ok|' + (email ? '1' : '0');
-          } catch(e) { return 'err|' + e.message; }
+
+            // 2. 在密码登录模式下，针对邮箱账号（国内版通常默认展示手机号+密码），自动切换为「邮箱登录」
+            const isTargetEmail = ${JSON.stringify(!!isEmail)};
+            if (isTargetEmail) {
+              const phoneInput = document.querySelector('input[type="tel"], input[placeholder*="手机"], input[placeholder*="11位"]');
+              const hasEmailInput = !!document.querySelector('input[type="email"], input[name="email"], input[placeholder*="邮箱" i], input[placeholder*="mail" i]');
+              
+              if (phoneInput || !hasEmailInput) {
+                const elements = [...document.querySelectorAll('button, a, div[role="button"], span, div, li, [role="tab"], .ds-button__content')];
+                const emailBtn = elements.find(el => {
+                  const t = (el.textContent || '').replace(/\\s+/g, '');
+                  const isMatch = (t.includes('邮箱登录') || t.includes('使用邮箱登录') || t.includes('邮箱账号登录') || t === '邮箱') && isVisible(el);
+                  if (!isMatch) return false;
+                  // 排除当前已经是 active/selected 状态的元素
+                  if (el.getAttribute('aria-selected') === 'true' || el.classList.contains('is-active') || el.classList.contains('active')) {
+                    return false;
+                  }
+                  return true;
+                });
+                if (emailBtn) {
+                  const target = emailBtn.closest('button, div[role="button"], a') || emailBtn;
+                  target.click();
+                  switchedEmail = true;
+                }
+              }
+            } else {
+              // 目标为手机号账号：若当前处于邮箱模式，切换回手机登录
+              const emailInput = document.querySelector('input[type="email"], input[placeholder*="邮箱" i]');
+              if (emailInput) {
+                const elements = [...document.querySelectorAll('button, a, div[role="button"], span, div, li, [role="tab"]')];
+                const phoneBtn = elements.find(el => {
+                  const t = (el.textContent || '').replace(/\\s+/g, '');
+                  return (t.includes('手机号登录') || t.includes('手机登录') || t.includes('使用手机登录') || t === '手机') && isVisible(el);
+                });
+                if (phoneBtn) {
+                  const target = phoneBtn.closest('button, div[role="button"], a') || phoneBtn;
+                  target.click();
+                }
+              }
+            }
+
+            return JSON.stringify({ pwd: !!pwd, switchedPwd, switchedEmail });
+          } catch(e) {
+            return JSON.stringify({ error: e.message });
+          }
         })()`;
+        try {
+            const raw = await this.ev(expr);
+            const r = JSON.parse(raw || '{}');
+            if (r.switchedPwd) console.log('[ds-login] 自动从验证码登录切换至「密码登录」模式');
+            if (r.switchedEmail) console.log('[ds-login] 自动从手机号模式切换至「邮箱登录」模式');
+            return r;
+        } catch (e) {
+            return {};
+        }
+    }
+
+    async waitSignInForm(timeoutMs, isEmail = true) {
+        const t0 = Date.now();
+        const limit = timeoutMs || 60000;
         while (Date.now() - t0 < limit) {
+            await this.switchFormMode(isEmail);
+            const expr = `(function(){
+              try {
+                let pwd = document.querySelector('input[type="password"]');
+                if (!pwd) return 'none';
+                const form = pwd.form || pwd.closest('form');
+                let inputEl = ${JSON.stringify(isEmail)}
+                  ? document.querySelector('input[type="email"],input[name="email"],input[placeholder*="mail" i],input[placeholder*="邮箱" i],input[autocomplete="username"]')
+                  : document.querySelector('input[name="mobile"],input[type="tel"],input[placeholder*="手机" i],input[autocomplete="username"]');
+                if (!inputEl && form) inputEl = form.querySelector('input:not([type="password"])');
+                return 'ok|' + (inputEl ? '1' : '0');
+              } catch(e) { return 'err|' + e.message; }
+            })()`;
             try {
                 const s = await this.ev(expr);
                 if (typeof s === 'string' && s.startsWith('ok|')) return true;
@@ -419,19 +497,12 @@ class BrowserSession {
     }
 
     /** 单次检查登录表单是否可见（不等待） */
-    async signInFormVisible() {
+    async signInFormVisible(isEmail = true) {
         try {
+            await this.switchFormMode(isEmail);
             const s = await this.ev(`(function(){
               try {
-                let pwd = document.querySelector('input[type="password"]');
-                if (!pwd) {
-                  const spans = [...document.querySelectorAll('.ds-button__content, span, div, a, button')];
-                  const pwdBtn = spans.find(s => (s.textContent || '').trim() === '密码登录');
-                  if (pwdBtn) {
-                    (pwdBtn.closest('div[role="button"], button') || pwdBtn).click();
-                  }
-                  pwd = document.querySelector('input[type="password"]');
-                }
+                const pwd = document.querySelector('input[type="password"]');
                 return pwd ? '1' : '';
               } catch(e) { return ''; }
             })()`);
@@ -459,47 +530,68 @@ class BrowserSession {
         const mobile = String(o.mobile || '').trim();
         const password = String(o.password || '');
         const account = email || mobile;
+        const isEmail = !!email;
         if (!account || !password) return false;
+
+        // 提交前先确保已切换到对应模式
+        await this.switchFormMode(isEmail);
+        await sleep(300);
 
         const expr = `(function(){
           try {
-            let pwd = document.querySelector('input[type="password"]');
-            if (!pwd) {
-              const spans = [...document.querySelectorAll('.ds-button__content, span, div, a, button')];
-              const pwdBtn = spans.find(s => (s.textContent || '').trim() === '密码登录');
-              if (pwdBtn) {
-                (pwdBtn.closest('div[role="button"], button') || pwdBtn).click();
-              }
-              pwd = document.querySelector('input[type="password"]');
+            function isVisible(el) {
+              if (!el) return false;
+              return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
             }
+
+            let pwd = document.querySelector('input[type="password"]');
             if (!pwd) return 'no-pwd';
             const form = pwd.form || pwd.closest('form');
-            let emailEl = document.querySelector('input[type="email"],input[name="email"],input[placeholder*="mail" i],input[placeholder*="邮箱" i],input[placeholder*="手机" i],input[autocomplete="username"]');
-            if (!emailEl && form) {
+
+            // 查找账号输入框（邮箱或手机）
+            let accountEl = null;
+            const isTargetEmail = ${JSON.stringify(isEmail)};
+            if (isTargetEmail) {
+              accountEl = document.querySelector('input[type="email"],input[name="email"],input[placeholder*="mail" i],input[placeholder*="邮箱" i],input[autocomplete="username"]');
+            } else {
+              accountEl = document.querySelector('input[name="mobile"],input[type="tel"],input[placeholder*="手机" i],input[placeholder*="11位"]');
+            }
+            if (!accountEl && form) {
               const inputs = [...(form.querySelectorAll('input')||[])].filter(i => i !== pwd && i.type !== 'hidden' && i.type !== 'submit');
-              emailEl = inputs[0] || null;
+              accountEl = inputs[0] || null;
             }
-            if (!emailEl && ` + JSON.stringify(!!mobile) + `) {
-              emailEl = document.querySelector('input[name="mobile"],input[type="tel"],input[placeholder*="手机" i]');
+            if (!accountEl) {
+              const allInputs = [...document.querySelectorAll('input:not([type="password"]):not([type="hidden"]):not([type="submit"])')];
+              accountEl = allInputs.find(i => isVisible(i)) || allInputs[0] || null;
             }
+            if (!accountEl) return 'no-account-input';
+
             const acc = ${JSON.stringify(account)};
             const pass = ${JSON.stringify(password)};
-            if (emailEl) {
-              const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-              setter.call(emailEl, acc);
-              emailEl.dispatchEvent(new Event('input', { bubbles: true }));
-              emailEl.dispatchEvent(new Event('change', { bubbles: true }));
+
+            function setVal(el, val) {
+              const proto = Object.getPrototypeOf(el);
+              const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+              if (desc && desc.set) {
+                desc.set.call(el, val);
+              } else {
+                el.value = val;
+              }
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+              el.dispatchEvent(new Event('blur', { bubbles: true }));
             }
-            const setterP = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-            setterP.call(pwd, pass);
-            pwd.dispatchEvent(new Event('input', { bubbles: true }));
-            pwd.dispatchEvent(new Event('change', { bubbles: true }));
+
+            setVal(accountEl, acc);
+            setVal(pwd, pass);
+
+            // 查找登录提交按钮
             let btn = (form && (form.querySelector('button[type="submit"],button'))) ||
                       document.querySelector('button[type="submit"]');
             if (!btn) {
-              btn = [...document.querySelectorAll('button,div[role="button"],span')].find(function(el){
-                const t = (el.textContent||'').trim();
-                return /登录|登陆|sign in|log in/i.test(t) && el.offsetParent !== null;
+              btn = [...document.querySelectorAll('button,div[role="button"],span,.ds-button')].find(function(el){
+                const t = (el.textContent||'').replace(/\\s+/g, '');
+                return (t === '登录' || t === '立即登录' || t === 'Sign In' || t === 'Log In' || /登录|sign in/i.test(t)) && isVisible(el);
               });
             }
             if (!btn) return 'no-btn';
@@ -550,7 +642,7 @@ class BrowserSession {
                 }
 
                 if (!submitted) {
-                    const formOk = await this.waitSignInForm(4000);
+                    const formOk = await this.waitSignInForm(4000, !!o.email);
                     if (formOk) {
                         const clicked = await this.fillAndSubmitLogin(o);
                         if (clicked) {
@@ -566,7 +658,7 @@ class BrowserSession {
                     if (tok2 && tok2.length > 20) {
                         return { ok: true, token: tok2, deviceId: did, from: 'form-headful' };
                     }
-                    if (!verify && await this.signInFormVisible()) {
+                    if (!verify && await this.signInFormVisible(!!o.email)) {
                         await this.fillAndSubmitLogin(o);
                         submitAt = Date.now();
                     }

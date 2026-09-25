@@ -312,16 +312,16 @@ class AccountPool {
             throw this._noAccountError(`可用账号已熔断暂停（原因: ${firstErr}），请在控制台「账号管理」中更新有效 Token 喵`, accName);
         }
 
-        // 5. 若未排除账号都在冷却期中，挑一个冷却时间最快到期的账号进行尝试（借鉴原版容灾自愈设计）
-        const cooldownList = nonExcluded.filter(a => now < a.disabledUntil);
+        // 5. 若未排除账号都在冷却期中，挑选冷却时间最快到期/在途最少的账号立即尝试自愈，绝不因冷却直接拒绝调度
+        const cooldownList = nonExcluded.filter(a => now < a.disabledUntil && !a.paused && a.state !== STATUS.AUTH_FAILED);
         if (cooldownList.length > 0) {
-            cooldownList.sort((a, b) => a.disabledUntil - b.disabledUntil);
+            cooldownList.sort((a, b) => {
+                if (a.disabledUntil !== b.disabledUntil) return a.disabledUntil - b.disabledUntil;
+                return (a.inflight || 0) - (b.inflight || 0);
+            });
             const best = cooldownList[0];
             const waitSec = Math.max(0, Math.round((best.disabledUntil - now) / 1000));
-            // 如果冷却期超过 10 秒则提示稍后，如果在 10 秒以内则直接借用它尝试自愈
-            if (waitSec > 10) {
-                throw this._noAccountError(`账号正在冷却中（最快需等待 ${waitSec} 秒），请稍后重试喵`, best.name);
-            }
+            logger.warn(`账号池暂时都在冷却中，优先借用最快解冻账号 ${best.name}（余 ${waitSec}s）尝试自愈，保持调度不中断喵`);
             best.inflight = Math.max(0, (best.inflight || 0) + 1);
             best.lastUsedAt = now;
             return best;
@@ -368,6 +368,7 @@ class AccountPool {
             statusCode === 401 ||
             /invalid token|token expired|40003|鉴权失败|未登录/i.test(errMsg);
 
+        // 仅在明确遇到 40003 (或确凿的 Token 过期/失效鉴权错误) 时才熔断并暂停调度
         if (isAuthError) {
             acc.state = STATUS.AUTH_FAILED;
             acc.paused = true;
@@ -381,44 +382,37 @@ class AccountPool {
             return;
         }
 
+        // 官方风控禁言/频控（bizCode=5 等）：只做临时较长退避冷却（如 3 分钟），冷却后自动恢复，绝不暂停调度
         const isMutedOrBanned = bizCode === 5 ||
             /user is muted|account banned|forbidden|被禁言/i.test(errMsg);
 
         if (isMutedOrBanned) {
-            acc.state = STATUS.PAUSED;
-            acc.paused = true;
-            logger.err(`🚨 账号 ${acc.name} 被官方风控禁言/封禁 [bizCode=${bizCode}]，已立即熔断并暂停调度！错误: ${errMsg}`);
-            this.persistAccountState(acc.name, { paused: true, lastLoginError: errMsg });
+            const muteCooldownMs = 180 * 1000;
+            acc.disabledUntil = Date.now() + muteCooldownMs;
+            acc.state = STATUS.COOLDOWN;
+            logger.warn(`⚠️ 账号 ${acc.name} 触发官方风控/频控 [bizCode=${bizCode}]，进入退避冷却 ${Math.round(muteCooldownMs / 1000)}s（冷却后自动恢复，绝不暂停调度）: ${errMsg}`);
             return;
         }
 
-        // 网络抖动 / 空响应 / 停滞：短暂轻冷却，超过 3 次则按普通故障累计熔断，避免死循环空回
+        // 网络抖动 / 空响应 / 停滞超时：短暂轻冷却，冷却后自动继续调度，绝不暂停调度
         const isTransient = /上游网络异常|空响应|连接中断|停滞超时|fetch failed|AbortError|UND_ERR|ECONNRESET|ETIMEDOUT/i.test(errMsg)
             || statusCode === 502 || statusCode === 504;
-        if (isTransient && acc.failures < 3) {
-            const lightMs = 3000;
-            acc.disabledUntil = Math.max(acc.disabledUntil, Date.now() + lightMs);
-            if (acc.state !== STATUS.PAUSED && acc.state !== STATUS.AUTH_FAILED) {
+        if (isTransient) {
+            const lightMs = Math.min(3000 * Math.pow(1.5, Math.min(acc.failures - 1, 4)), 15000);
+            acc.disabledUntil = Date.now() + lightMs;
+            if (acc.state !== STATUS.AUTH_FAILED) {
                 acc.state = STATUS.COOLDOWN;
             }
-            logger.warn(`账号 ${acc.name} 瞬时故障，轻冷却 ${Math.round(lightMs / 1000)}s（不计熔断）: ${errMsg}`);
+            logger.warn(`账号 ${acc.name} 瞬时网络/上游故障，轻度冷却 ${Math.round(lightMs / 1000)}s（持续可用，不暂停调度）: ${errMsg}`);
             return;
         }
 
-        // 普通退避冷却
+        // 普通错误退避冷却：只要没有 40003，无论失败多少次都绝不暂停调度，仅增加冷却时间
         const shift = Math.min(acc.failures - 1, 5);
         const cooldownMs = Math.min(config.COOLDOWN_BASE_MS * Math.pow(2, shift), config.COOLDOWN_MAX_MS);
         acc.disabledUntil = Date.now() + cooldownMs;
         acc.state = STATUS.COOLDOWN;
-        logger.warn(`账号 ${acc.name} 调用失败 ${acc.failures} 次，冷却 ${Math.round(cooldownMs / 1000)}s: ${errMsg}`);
-
-        const failLimit = Math.max(1, config.CIRCUIT_BREAKER_FAIL_LIMIT || 3);
-        if (acc.failures >= failLimit) {
-            acc.state = STATUS.PAUSED;
-            acc.paused = true;
-            logger.err(`账号 ${acc.name} 连续失败 ${failLimit} 次，已自动暂停调度！`);
-            this.persistAccountState(acc.name, { paused: true, lastLoginError: '连续多次失败，已自动暂停' });
-        }
+        logger.warn(`账号 ${acc.name} 调用异常（第 ${acc.failures} 次），退避冷却 ${Math.round(cooldownMs / 1000)}s（冷却后自动调度，绝不暂停）: ${errMsg}`);
     }
 
     async triggerAutoRelogin(account) {
