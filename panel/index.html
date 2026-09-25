@@ -556,6 +556,7 @@ async function loadAccounts() {
         `<td><span style="font-size:11px;color:${a.lastError?'var(--err)':'var(--dim)'}">${esc(a.lastError || '正常运行无异常')}</span></td>` +
         `<td><div class="flex">` +
           `<button class="btn primary btn-test-acc" data-i="${a.index}">连通测试</button>` +
+          (a.hasPassword && (a.email || a.mobile) ? `<button class="btn btn-login-acc" data-i="${a.index}" title="在服务器启动无头浏览器登录并刷新 Token">无头刷新</button>` : '') +
           `<button class="btn btn-tog-acc" data-i="${a.index}" data-p="${!a.paused}">${a.paused?'恢复调度':'暂停'}</button>` +
           `<button class="btn btn-edit-acc" data-i="${a.index}">编辑账号</button>` +
           `<button class="btn danger btn-del-acc" data-i="${a.index}">删除</button>` +
@@ -598,6 +599,20 @@ function bindAccountEvents(accs) {
       toast(res.message || '探测成功，Token 有效！', 'ok');
     } catch(e) {
       toast('探测失败: ' + e.message, 'err');
+    } finally {
+      loadAccounts();
+    }
+  });
+
+  document.querySelectorAll('.btn-login-acc').forEach(b => b.onclick = async () => {
+    const idx = b.dataset.i;
+    b.disabled = true;
+    b.textContent = '无头登录中...';
+    try {
+      const res = await api(`/api/accounts/${idx}/login`, { method: 'POST' });
+      toast('🎉 无头重登成功，Token 已更新！', 'ok');
+    } catch(e) {
+      toast('❌ 无头重登未成功: ' + e.message, 'err');
     } finally {
       loadAccounts();
     }
