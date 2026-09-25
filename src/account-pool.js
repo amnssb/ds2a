@@ -43,7 +43,13 @@ class AccountPool {
         this.accounts = [];
         this.cursor = 0;
         this._rawCache = null;
+        this._sweeping = false;
         this.reload();
+        // 开机 5 秒后主动扫描并自动自愈拉活已失效/暂停的账号；之后每 10 分钟定期巡检一次
+        const t1 = setTimeout(() => this.sweepAndAutoHeal().catch(() => {}), 5000);
+        if (t1.unref) t1.unref();
+        const t2 = setInterval(() => this.sweepAndAutoHeal().catch(() => {}), 10 * 60 * 1000);
+        if (t2.unref) t2.unref();
     }
 
     /** 读取原始账号数据，以 data/accounts.json 为唯一权威源，过滤假账号示例 */
@@ -448,6 +454,33 @@ class AccountPool {
             logger.err(`账号 ${account.name} 自动重登异常: ${e.message}`);
             this.updateAccount(account.index, { lastLoginError: '自动重登异常: ' + e.message, paused: true });
             return false;
+        }
+    }
+
+    /** 巡检池中所有处于暂停/失效且有账密的账号，主动执行无头重登自愈 */
+    async sweepAndAutoHeal() {
+        if (this._sweeping) return;
+        this._sweeping = true;
+        try {
+            const candidates = this.accounts.filter(a =>
+                !a.disabled &&
+                (a.paused || a.state === STATUS.AUTH_FAILED || !a.token) &&
+                a.autoLogin && a.password && (a.email || a.mobile)
+            );
+            if (!candidates.length) return;
+            logger.info(`🔍 [自愈巡检] 发现 ${candidates.length} 个处于暂停/失效且配置了账密的账号，启动后台无头重登自愈...`);
+            for (const acc of candidates) {
+                // 如果在循环过程中已被其他操作恢复则跳过
+                if (!acc.paused && acc.state !== STATUS.AUTH_FAILED && acc.token) continue;
+                try {
+                    await this.triggerAutoRelogin(acc);
+                    await new Promise(r => setTimeout(r, 2000));
+                } catch (e) {
+                    logger.err(`[自愈巡检] 账号 ${acc.name} 自愈异常: ${e.message}`);
+                }
+            }
+        } finally {
+            this._sweeping = false;
         }
     }
 
