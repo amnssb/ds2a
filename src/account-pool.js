@@ -415,36 +415,39 @@ class AccountPool {
             return;
         }
 
-        // 官方风控禁言/冻结/封禁（bizCode=5 等）：抓取状态用于自动冻结到该时间，不再仅做短冷却导致死循环
+        // 官方风控禁言/冻结/封禁（bizCode=5 等）：立即暂停调度并持久化，异步抓取解冻时间
         const isMutedOrBanned = bizCode === 5 ||
             /user is muted|account banned|forbidden|被禁言|冻结|封禁/i.test(errMsg);
 
         if (isMutedOrBanned) {
+            acc.paused = true;
+            acc.state = STATUS.PAUSED;
+            const initMsg = `账号被官方禁言暂停调度 [bizCode=${bizCode}] (user is muted)`;
+            acc.lastError = initMsg;
+            this.persistAccountState(acc.name, { paused: true, lastLoginError: initMsg });
+            logger.warn(`🚨 账号 ${acc.name} 触发官方风控禁言 [bizCode=${bizCode}]，已立即暂停调度并持久化落盘喵！`);
+
             // 异步探测官方账号详情，抓取确切的解冻时间或永久封禁状态
             this.checkAccountStatusAsync(acc).then(bizData => {
                 if (bizData && bizData.chat && bizData.chat.is_muted === 1 && bizData.chat.mute_until) {
                     const muteUntilMs = Math.round(Number(bizData.chat.mute_until) * 1000);
                     acc.disabledUntil = muteUntilMs;
                     acc.frozenUntil = new Date(muteUntilMs).toISOString();
-                    acc.state = STATUS.COOLDOWN;
                     const msg = `账号被官方暂时冻结至 ${new Date(muteUntilMs).toLocaleString()} (user is muted)`;
                     acc.lastError = msg;
-                    this.persistAccountState(acc.name, { disabledUntil: muteUntilMs, frozenUntil: acc.frozenUntil, lastLoginError: msg });
-                    logger.warn(`⚠️ 账号 ${acc.name} 触发官方风控冻结，解冻时间: ${new Date(muteUntilMs).toLocaleString()}，已自动冻结至该时间喵！`);
+                    this.persistAccountState(acc.name, {
+                        paused: true,
+                        disabledUntil: muteUntilMs,
+                        frozenUntil: acc.frozenUntil,
+                        lastLoginError: msg
+                    });
+                    logger.warn(`⚠️ 账号 ${acc.name} 抓取到精确官方解冻时间: ${new Date(muteUntilMs).toLocaleString()}，已更新记录喵！`);
                 } else if (bizData && (bizData.status !== 0 || (bizData.chat && bizData.chat.is_muted === 1 && !bizData.chat.mute_until))) {
-                    acc.state = STATUS.PAUSED;
-                    acc.paused = true;
                     acc.lastError = '账号已被官方永久封禁';
                     this.persistAccountState(acc.name, { paused: true, lastLoginError: '账号已被官方永久封禁' });
-                    logger.err(`🚨 账号 ${acc.name} 已被官方永久封禁，已自动暂停调度喵！`);
+                    logger.err(`🚨 账号 ${acc.name} 已被官方永久封禁，已保持暂停调度喵！`);
                 }
             }).catch(() => {});
-
-            // 同步先设定 1 小时安全退避冻结，防止在此期间被调度循环报错
-            const defaultMuteMs = 3600 * 1000;
-            acc.disabledUntil = Math.max(acc.disabledUntil, Date.now() + defaultMuteMs);
-            acc.state = STATUS.COOLDOWN;
-            logger.warn(`⚠️ 账号 ${acc.name} 触发官方风控/频控 [bizCode=${bizCode}]，进入退避冻结（最少 1 小时，后台异步抓取精确解冻时间）: ${errMsg}`);
             return;
         }
 

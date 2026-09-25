@@ -163,7 +163,7 @@ router.post('/api/accounts/:index/resume', (req, res) => {
     res.json({ ok });
 });
 
-// 一键测试 Token 连通性
+// 一键测试 Token 连通性（同时严格校验官方风控与禁言状态）
 router.post('/api/accounts/:index/test', async (req, res) => {
     const idx = Number(req.params.index);
     const acc = accountPool.accounts[idx];
@@ -172,13 +172,41 @@ router.post('/api/accounts/:index/test', async (req, res) => {
     }
 
     try {
-        // 创建一次性会话探测 Token
+        // 1. 创建一次性会话探测 Token 鉴权是否通过
         const sid = await ds.createSession(acc.token, acc.proxy || '');
-        // 探测成功后立刻删除探测会话
         await ds.deleteSession(acc.token, sid, acc.proxy || '').catch(() => {});
+
+        // 2. 深度探测官方用户状态，严查是否被官方禁言 (user is muted) 或封禁
+        const userStatus = await accountPool.checkAccountStatusAsync(acc);
+        if (userStatus) {
+            if (userStatus.chat && userStatus.chat.is_muted === 1) {
+                const muteUntil = userStatus.chat.mute_until ? Number(userStatus.chat.mute_until) * 1000 : 0;
+                const freezeMsg = muteUntil ? `官方冻结至 ${new Date(muteUntil).toLocaleString()}` : '永久禁言';
+                const errText = `账号已被官方禁言 (${freezeMsg})，已自动保持暂停调度喵`;
+                accountPool.markFail(acc, new Error(errText), 403, 5);
+                return res.status(403).json({
+                    ok: false,
+                    error: errText,
+                    bizCode: 5,
+                    status: 'paused',
+                    frozenUntil: acc.frozenUntil,
+                });
+            }
+            if (userStatus.status !== 0) {
+                const errText = '账号已被官方封禁 (status != 0)';
+                accountPool.markFail(acc, new Error(errText), 403, 40003);
+                return res.status(403).json({
+                    ok: false,
+                    error: errText,
+                    bizCode: 40003,
+                    status: 'paused',
+                });
+            }
+        }
+
         accountPool.markOk(acc);
         accountPool.resumeAccount(idx);
-        res.json({ ok: true, message: 'Token 验证成功，服务正常！已恢复正常调度。' });
+        res.json({ ok: true, message: 'Token 验证成功，未受风控，服务正常！已恢复正常调度。' });
     } catch (e) {
         const bizCode = e.bizCode || (e.message.match(/code=(\d+)/) ? Number(e.message.match(/code=(\d+)/)[1]) : null);
         accountPool.markFail(acc, e, e.statusCode || 500, bizCode);
