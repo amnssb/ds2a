@@ -210,7 +210,7 @@ function resolveSearch(body) {
     return true;
 }
 
-// ---------- 工具调用协议 ----------
+// ---------- 工具调用协议 (<<<TOOL_CALL>>> 协议 + 裸JSON/<<>>高容错提取与流式分流) ----------
 const TC_START = '<<<TOOL_CALL>>>';
 const TC_END = '<<<END_TOOL_CALL>>>';
 
@@ -231,29 +231,107 @@ function injectTools(prompt, tools) {
     return prompt + '\n\n[Available Tools]\n' + defs + '\n\n当需要调用工具时，请在回复末尾严格按以下格式输出（可多个）：\n' + TC_START + '\n{"name": "工具名", "arguments": { ...JSON参数... }}\n' + TC_END + '\n工具调用必须放在回复最后，arguments 必须是合法 JSON。';
 }
 
+function extractArguments(obj) {
+    if (obj.arguments !== undefined) {
+        return typeof obj.arguments === 'string' ? obj.arguments : JSON.stringify(obj.arguments || {});
+    }
+    if (obj.parameters !== undefined) {
+        return typeof obj.parameters === 'string' ? obj.parameters : JSON.stringify(obj.parameters || {});
+    }
+    const args = Object.assign({}, obj);
+    delete args.name;
+    delete args.type;
+    delete args.id;
+    return JSON.stringify(args);
+}
+
 function parseToolCalls(text) {
-    if (!text || text.indexOf(TC_START) < 0) return { content: text, toolCalls: [] };
+    if (!text) return { content: '', toolCalls: [] };
     const calls = [];
     const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const re = new RegExp(esc(TC_START) + '([\\s\\S]*?)' + esc(TC_END), 'g');
-    const clean = text.replace(re, (m, inner) => {
-        const raw = String(inner).trim();
+    let clean = text;
+
+    // 1. 标准 <<<TOOL_CALL>>> ... <<<END_TOOL_CALL>>>
+    if (clean.includes(TC_START)) {
+        const re = new RegExp(esc(TC_START) + '([\\s\\S]*?)' + esc(TC_END), 'g');
+        clean = clean.replace(re, (_, inner) => {
+            try {
+                const j = JSON.parse(inner.trim());
+                for (const it of (Array.isArray(j) ? j : [j])) {
+                    if (!it || !it.name) continue;
+                    calls.push({
+                        id: 'call_' + crypto.randomBytes(6).toString('hex'),
+                        type: 'function',
+                        function: {
+                            name: String(it.name),
+                            arguments: extractArguments(it),
+                        },
+                    });
+                }
+            } catch (e) {}
+            return '';
+        });
+    }
+
+    // 2. 兼容处理 <<>> 分隔的裸 JSON 工具调用序列 (例如 OpenCode / DeepSeek 偶发裸输出)
+    if (clean.includes('<<>>')) {
+        const chunks = clean.split('<<>>');
+        const surviving = [];
+        for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i].trim();
+            if (!chunk) continue;
+            const jsonMatch = chunk.match(/\{[\s\S]*"name"\s*:\s*"([^"]+)"[\s\S]*\}/);
+            if (jsonMatch) {
+                try {
+                    const j = JSON.parse(jsonMatch[0]);
+                    if (j && j.name) {
+                        calls.push({
+                            id: 'call_' + crypto.randomBytes(6).toString('hex'),
+                            type: 'function',
+                            function: {
+                                name: String(j.name),
+                                arguments: extractArguments(j),
+                            },
+                        });
+                        const before = chunk.slice(0, jsonMatch.index).trim();
+                        if (before) surviving.push(before);
+                        continue;
+                    }
+                } catch (e) {}
+            }
+            surviving.push(chunk);
+        }
+        clean = surviving.join('\n\n').trim();
+    }
+
+    // 3. 兼容末尾出现的单独裸 JSON 工具调用 (无 <<<TOOL_CALL>>> 包装)
+    const reStandaloneJson = /\n*\s*\{[\s\n\r]*"name"\s*:\s*"([^"]+)"[\s\S]*\}\s*$/;
+    const standaloneMatch = clean.match(reStandaloneJson);
+    if (standaloneMatch) {
         try {
-            const j = JSON.parse(raw);
-            for (const it of (Array.isArray(j) ? j : [j])) {
-                if (!it || !it.name) continue;
+            const j = JSON.parse(standaloneMatch[0].trim());
+            if (j && j.name) {
                 calls.push({
                     id: 'call_' + crypto.randomBytes(6).toString('hex'),
                     type: 'function',
                     function: {
-                        name: String(it.name),
-                        arguments: typeof it.arguments === 'string' ? it.arguments : JSON.stringify(it.arguments || {}),
+                        name: String(j.name),
+                        arguments: extractArguments(j),
                     },
                 });
+                clean = clean.slice(0, standaloneMatch.index).trim();
             }
         } catch (e) {}
-        return '';
-    }).replace(/\n{3,}/g, '\n\n').trim();
+    }
+
+    // 4. 清理残留元标记与多余空行
+    clean = clean
+        .replace(/<[｜\|]?DSML[｜\|][\s\S]*?>/gi, '')
+        .replace(/<\/?[a-zA-Z0-9_-]*tool_calls?>/gi, '')
+        .replace(/\[citation:\d+\]/g, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+
     return { content: clean, toolCalls: calls };
 }
 
@@ -263,52 +341,124 @@ function safeParseToolArgs(raw) {
     try { return JSON.parse(s); } catch (e) { return { _raw: String(s) }; }
 }
 
-function createToolCallFilter(hasTools, emit) {
-    if (!hasTools) return { push: (d) => emit(d), flush: () => {} };
-    const START = TC_START, END = TC_END;
-    let buf = '', inToolCall = false;
+/** 流式筛分器：实时拦截 <think> 思考链并分流至 onThinking，阻断工具调用字符泄露至正文 */
+function createToolCallFilter(hasTools, emit, onThinking) {
+    let buf = '';
+    let inThink = false;
+    let inTool = false;
 
-    function isPartialPrefix(s, target) { return target.startsWith(s); }
+    const THINK_START = '<think>';
+    const THINK_END = '</think>';
 
-    function push(delta) {
+    function feed(delta) {
         if (!delta) return;
         buf += delta;
-        while (buf.length) {
-            if (inToolCall) {
-                const endIdx = buf.indexOf(END);
-                if (endIdx < 0) {
-                    for (let k = Math.min(buf.length, END.length - 1); k > 0; k--) {
-                        if (isPartialPrefix(buf.slice(-k), END)) return;
-                    }
-                    buf = '';
-                    return;
+
+        while (buf.length > 0) {
+            // 1. 处于思考标签内部：将内容实时分流至 onThinking，绝不漏进正文
+            if (inThink) {
+                const endIdx = buf.indexOf(THINK_END);
+                if (endIdx >= 0) {
+                    const thinkChunk = buf.slice(0, endIdx);
+                    if (thinkChunk && onThinking) onThinking(thinkChunk);
+                    buf = buf.slice(endIdx + THINK_END.length);
+                    inThink = false;
+                    continue;
                 }
-                buf = buf.slice(endIdx + END.length);
-                inToolCall = false;
-                continue;
-            }
-            const startIdx = buf.indexOf(START);
-            if (startIdx >= 0) {
-                if (startIdx > 0) emit(buf.slice(0, startIdx));
-                buf = buf.slice(startIdx + START.length);
-                inToolCall = true;
-                continue;
-            }
-            let hold = 0;
-            for (let k = Math.min(buf.length, START.length - 1); k > 0; k--) {
-                if (isPartialPrefix(buf.slice(-k), START)) { hold = k; break; }
-            }
-            if (hold > 0) {
-                if (buf.length > hold) emit(buf.slice(0, buf.length - hold));
+                // 检查是否有 partial THINK_END 截断在末尾
+                let hold = 0;
+                for (let k = Math.min(buf.length, THINK_END.length - 1); k > 0; k--) {
+                    if (THINK_END.startsWith(buf.slice(-k))) { hold = k; break; }
+                }
+                const toEmit = buf.slice(0, buf.length - hold);
+                if (toEmit && onThinking) onThinking(toEmit);
                 buf = buf.slice(buf.length - hold);
                 return;
             }
-            emit(buf);
+
+            // 2. 处于工具调用块内部：静默缓冲，绝不外发给客户端正文
+            if (inTool) {
+                const endIdx = buf.indexOf(TC_END);
+                if (endIdx >= 0) {
+                    buf = buf.slice(endIdx + TC_END.length);
+                    inTool = false;
+                    continue;
+                }
+                return;
+            }
+
+            // 3. 检查是否进入 <think>
+            const thinkIdx = buf.indexOf(THINK_START);
+            if (thinkIdx >= 0) {
+                if (thinkIdx > 0 && emit) emit(buf.slice(0, thinkIdx));
+                buf = buf.slice(thinkIdx + THINK_START.length);
+                inThink = true;
+                continue;
+            }
+
+            // 4. 若启用了工具，检查是否进入工具标记
+            if (hasTools) {
+                const tcIdx = buf.indexOf(TC_START);
+                if (tcIdx >= 0) {
+                    if (tcIdx > 0 && emit) emit(buf.slice(0, tcIdx));
+                    buf = buf.slice(tcIdx + TC_START.length);
+                    inTool = true;
+                    continue;
+                }
+
+                // 检查裸 JSON 工具调用: \n{"name": 或 {"name":
+                const rawJsonMatch = buf.match(/(?:^|\n)\s*\{\s*"name"\s*:\s*"/);
+                if (rawJsonMatch) {
+                    const idx = rawJsonMatch.index;
+                    if (idx > 0 && emit) emit(buf.slice(0, idx));
+                    buf = buf.slice(idx);
+                    inTool = true;
+                    return;
+                }
+            }
+
+            // 5. 检查边缘 partial 截断（防止标签被分片打断泄露）
+            let hold = 0;
+            const candidates = [THINK_START];
+            if (hasTools) candidates.push(TC_START, '<|DSML|', '<tool_calls>', '<tool_call>');
+            for (const cand of candidates) {
+                for (let k = Math.min(buf.length, cand.length - 1); k > 0; k--) {
+                    if (cand.startsWith(buf.slice(-k))) {
+                        hold = Math.max(hold, k);
+                    }
+                }
+            }
+
+            if (hasTools) {
+                const jsonPrefixes = ['\n', '\n{', '\n{"', '\n{"name', '\n{"name"', '\n{"name":'];
+                for (const p of jsonPrefixes) {
+                    if (buf.endsWith(p)) {
+                        hold = Math.max(hold, p.length);
+                    }
+                }
+            }
+
+            if (hold > 0) {
+                const safe = buf.slice(0, buf.length - hold);
+                if (safe && emit) emit(safe);
+                buf = buf.slice(buf.length - hold);
+                return;
+            }
+
+            if (emit) emit(buf);
             buf = '';
             return;
         }
     }
-    return { push, flush: () => { if (buf && !inToolCall) emit(buf); buf = ''; } };
+
+    function flush() {
+        if (buf && !inThink && !inTool) {
+            if (emit) emit(buf);
+        }
+        buf = '';
+    }
+
+    return { push: feed, flush };
 }
 
 function resolveApiKey(req) {
@@ -663,6 +813,16 @@ router.post('/v1/chat/completions', async (req, res) => {
                 res.write('data: ' + JSON.stringify(oaiChunk(id, { content: d }, body.model)) + '\n\n');
             }
         }
+    }, (thinkDelta) => {
+        thinking += thinkDelta;
+        if (stream) {
+            ensureStreamHeaders();
+            if (!oaiRoleSent) {
+                res.write('data: ' + JSON.stringify(oaiChunk(id, { role: 'assistant' }, body.model)) + '\n\n');
+                oaiRoleSent = true;
+            }
+            res.write('data: ' + JSON.stringify(oaiChunk(id, { reasoning_content: thinkDelta }, body.model)) + '\n\n');
+        }
     });
 
     try {
@@ -693,7 +853,7 @@ router.post('/v1/chat/completions', async (req, res) => {
         }
 
         const rawContent = r.content || content;
-        const parsed = (r.hasTools || hasTools) ? parseToolCalls(rawContent) : { content: rawContent, toolCalls: [] };
+        const parsed = (r.hasTools || hasTools) ? parseToolCalls(rawContent, body.tools) : { content: rawContent, toolCalls: [] };
         const finish = parsed.toolCalls.length ? 'tool_calls' : (r.finishReason === 'length' ? 'length' : 'stop');
 
         const { pTokens, cTokens, tTokens, totalTokens } = computeUsage(r, body, rawContent, thinking);
@@ -842,6 +1002,12 @@ router.post('/v1/messages', async (req, res) => {
         if (stream) {
             res.write('event: content_block_delta\ndata: ' + JSON.stringify({ type: 'content_block_delta', index: textBlockIndex(), delta: { type: 'text_delta', text: d } }) + '\n\n');
         }
+    }, (thinkDelta) => {
+        thinking += thinkDelta;
+        if (stream) {
+            const idx = ensureThinkBlock();
+            res.write('event: content_block_delta\ndata: ' + JSON.stringify({ type: 'content_block_delta', index: idx, delta: { type: 'thinking_delta', thinking: thinkDelta } }) + '\n\n');
+        }
     });
 
     // Claude content block 状态机：thinking 必须在 text 之前，块序号严格递增
@@ -895,7 +1061,7 @@ router.post('/v1/messages', async (req, res) => {
         }
 
         const rawContent = r.content || content;
-        const parsed = (r.hasTools || hasTools) ? parseToolCalls(rawContent) : { content: rawContent, toolCalls: [] };
+        const parsed = (r.hasTools || hasTools) ? parseToolCalls(rawContent, body.tools) : { content: rawContent, toolCalls: [] };
         const finish = parsed.toolCalls.length ? 'tool_use' : (r.finishReason === 'length' ? 'max_tokens' : 'end_turn');
 
         // 保证在有需要时补齐 text 块（客户端期待固定块序），但绝不把 thinking 重复复制为 text_delta 泄露到正文
@@ -1033,4 +1199,7 @@ router.get('/v1/models', (req, res) => {
 module.exports = {
     router,
     sessions,
+    injectTools,
+    parseToolCalls,
+    createToolCallFilter,
 };

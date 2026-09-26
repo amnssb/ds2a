@@ -287,11 +287,8 @@ class AccountPool {
                 }
             }
 
-            // 负载均衡：在途并发最少优先；同并发下最久未调用 (LRU) 优先，保证多账号完全均匀轮流调度
-            healthyCandidates.sort((a, b) => {
-                if (a.inflight !== b.inflight) return a.inflight - b.inflight;
-                return (a.lastUsedAt || 0) - (b.lastUsedAt || 0);
-            });
+            // 顺序调度：固定按账号下标依次使用，当前账号未失败（未被 exclude）前绝不切到下一个
+            healthyCandidates.sort((a, b) => a.index - b.index);
             const picked = healthyCandidates[0];
             picked.inflight = Math.max(0, (picked.inflight || 0) + 1);
             picked.lastUsedAt = now;
@@ -309,10 +306,7 @@ class AccountPool {
                     return pref;
                 }
             }
-            atCap.sort((a, b) => {
-                if (a.inflight !== b.inflight) return a.inflight - b.inflight;
-                return (a.lastUsedAt || 0) - (b.lastUsedAt || 0);
-            });
+            atCap.sort((a, b) => a.index - b.index);
             const picked = atCap[0];
             picked.inflight = Math.max(0, (picked.inflight || 0) + 1);
             picked.lastUsedAt = now;

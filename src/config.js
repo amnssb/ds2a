@@ -100,7 +100,7 @@ module.exports = {
     REQUIRE_KEY: process.env.DS_REQUIRE_KEY === 'true',
 
     // 会话与超时
-    SESSION_TTL_MS: Math.max(1, Number(process.env.DS_SESSION_TTL_MIN || 15)) * 60 * 1000,
+    SESSION_TTL_MS: Math.min(20, Math.max(1, Number(process.env.DS_SESSION_TTL_MIN || 20))) * 60 * 1000,
     REQUEST_TIMEOUT_MS: Number(process.env.DS_TIMEOUT_MS || 90000),
     MAX_UPLOAD_MB: Number(process.env.DS_MAX_UPLOAD_MB || 30),
 

@@ -219,12 +219,6 @@ router.post('/api/accounts/:index/test', async (req, res) => {
     }
 });
 
-// 服务端无头补登已卸载，引导用户通过本机有头或 Studio 推送
-router.post('/api/accounts/:index/login', async (req, res) => {
-    res.status(400).json({
-        ok: false,
-        error: '服务端已卸载无头补登，请使用本机电脑运行 npm run push-tokens（有头窗口人工过验证）后自动推送 Token 喵'
-    });
-});
+// 服务端无头补登/自动刷新已彻底移除：Token 仅由本机有头工具或 Studio 推送更新
 
 module.exports = router;
